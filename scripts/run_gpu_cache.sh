@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# 显存缓存训练启动脚本
+# 使用方法: ./run_gpu_cache.sh [配置类型]
+
+CONFIG_TYPE=${1:-"basic"}  # 默认使用基础配置
+
+# 基本参数
+TRAIN_DATA_PATH="datasets/train"
+VAL_DATA_PATH="datasets/val"
+WINDOW_SIZE=64
+WINDOW_STRIDE=20
+BATCH_SIZE=1024
+NB_CODE=512
+CODE_DIM=128
+DOWN_T=2
+STRIDE_T=2
+WIDTH=512
+DEPTH=3
+LR=2e-4
+TOTAL_ITER=300000
+
+# 根据配置类型设置参数
+case $CONFIG_TYPE in
+  "basic")
+    echo "使用基础配置 - GPU缓存数据集"
+    USE_GPU_CACHE=true
+    GPU_CACHE_SIZE=5000
+    USE_PREFETCH=false
+    NUM_WORKERS=1
+    PIN_MEMORY=false
+    PERSISTENT_WORKERS=false
+    ;;
+  "prefetch")
+    echo "使用预取配置 - 预取数据加载器"
+    USE_GPU_CACHE=false
+    USE_PREFETCH=true
+    PREFETCH_FACTOR=2
+    NUM_WORKERS=1
+    PIN_MEMORY=true
+    PERSISTENT_WORKERS=true
+    ;;
+  "combined")
+    echo "使用组合配置 - GPU缓存 + 预取"
+    USE_GPU_CACHE=true
+    GPU_CACHE_SIZE=3000
+    USE_PREFETCH=true
+    PREFETCH_FACTOR=2
+    NUM_WORKERS=1
+    PIN_MEMORY=false
+    PERSISTENT_WORKERS=false
+    ;;
+  "aggressive")
+    echo "使用激进配置 - 最大GPU缓存"
+    USE_GPU_CACHE=true
+    GPU_CACHE_SIZE=10000
+    USE_PREFETCH=true
+    PREFETCH_FACTOR=3
+    NUM_WORKERS=0  # 不使用额外工作进程
+    PIN_MEMORY=false
+    PERSISTENT_WORKERS=false
+    ;;
+  "minimal")
+    echo "使用最小配置 - 最少系统内存使用"
+    USE_GPU_CACHE=true
+    GPU_CACHE_SIZE=2000
+    USE_PREFETCH=true
+    PREFETCH_FACTOR=1
+    NUM_WORKERS=0  # 不使用额外工作进程
+    PIN_MEMORY=false
+    PERSISTENT_WORKERS=false
+    BATCH_SIZE=512  # 减小批次大小
+    ;;
+  *)
+    echo "未知配置类型: $CONFIG_TYPE"
+    echo "可用配置: basic, prefetch, combined, aggressive, minimal"
+    exit 1
+    ;;
+esac
+
+# 构建命令
+CMD="python rvq_seamless_gpu_cache.py \
+  --train_data_path $TRAIN_DATA_PATH \
+  --val_data_path $VAL_DATA_PATH \
+  --window_size $WINDOW_SIZE \
+  --window_stride $WINDOW_STRIDE \
+  --batch_size $BATCH_SIZE \
+  --nb_code $NB_CODE \
+  --code_dim $CODE_DIM \
+  --down_t $DOWN_T \
+  --stride_t $STRIDE_T \
+  --width $WIDTH \
+  --depth $DEPTH \
+  --lr $LR \
+  --total_iter $TOTAL_ITER \
+  --multi_length_training \
+  --mixed_precision \
+  --num_workers $NUM_WORKERS"
+
+# 添加配置特定参数
+if [ "$USE_GPU_CACHE" = true ]; then
+  CMD="$CMD --use_gpu_cache --gpu_cache_size $GPU_CACHE_SIZE"
+fi
+
+if [ "$USE_PREFETCH" = true ]; then
+  CMD="$CMD --use_prefetch --prefetch_factor ${PREFETCH_FACTOR:-2}"
+fi
+
+if [ "$PIN_MEMORY" = true ]; then
+  CMD="$CMD --pin_memory"
+fi
+
+if [ "$PERSISTENT_WORKERS" = true ]; then
+  CMD="$CMD --persistent_workers"
+fi
+
+# 打印命令
+echo "执行命令:"
+echo $CMD
+
+# 执行命令
+eval $CMD

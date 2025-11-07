@@ -1,0 +1,11 @@
+{
+  "total_windows": 0,
+  "window_size": 60,
+  "window_stride": 30,
+  "multi_length_training": [
+    1.0
+  ],
+  "split": "test",
+  "data_path": "data/seamless_motions",
+  "num_samples": 0
+}
