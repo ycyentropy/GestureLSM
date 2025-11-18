@@ -1,0 +1,65 @@
+# 模型权重目录
+ckpt/
+weights/
+
+# 数据集目录
+datasets/
+BEAT2/
+beat_v2.0.0/
+
+# 缓存文件和目录
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.cache/
+
+# 输出和日志
+output/
+outputs/
+*.log
+logs/
+
+# 环境和配置
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# 依赖
+env/
+env3/
+venv/
+
+# IDE相关文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 压缩文件
+*.zip
+*.tar.gz
+*.tar.bz2
+*.tar
+
+# 其他可能的大型文件
+*.bin
+*.pth
+*.npy
+*.npz
+
+# TraeAI相关
+.trae/
+
+# 测试和临时文件
+*.tmp
+*.temp
+tmp/
+temp/

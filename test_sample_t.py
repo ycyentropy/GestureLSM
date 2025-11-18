@@ -1,4 +1,72 @@
 import numpy as np
+import smplx
+import torch
+import os
+
+# 设置中性模型文件路径
+model_path = '/home/embodied/yangchenyu/GestureLSM/datasets/hub/smplx_models/'
+
+# 检查文件是否存在
+if os.path.exists(model_path):
+    print(f"模型文件存在: {model_path}")
+    
+    # 现在我们已经安装了chumpy，可以直接尝试加载模型
+    print("使用smplx库加载SMPLH模型...")
+    try:
+        # 创建SMPLH模型实例
+        model = smplx.create(
+            model_path,
+            model_type='smplh',
+            gender='neutral',
+            batch_size=1,
+            use_pca=False,
+            create_transl=True
+        )
+        
+        print("✅ 模型加载成功！")
+        print(f"模型类型: {type(model).__name__}")
+        print(f"形状参数数量: {model.num_betas}")
+        # 通过测试前向传播来获取关节点数量
+        print("\n正在确定模型参数...")
+        
+        # 进行前向传播测试
+        print("\n执行前向传播测试...")
+        # 初始化参数（批量大小为1）
+        betas = torch.zeros([1, 10])  # 形状参数（10维）
+        global_orient = torch.zeros([1, 3])  # 全局旋转（3维）
+        body_pose = torch.zeros([1, 63])  # 身体姿态（21个关节×3维）
+        left_hand_pose = torch.zeros([1, 45])  # 左手姿态（15个关节×3维）
+        right_hand_pose = torch.zeros([1, 45])  # 右手姿态（15个关节×3维）
+        transl = torch.zeros([1, 3])  # 平移参数
+        
+        # 生成模型输出
+        output = model(
+            betas=betas,
+            global_orient=global_orient,
+            body_pose=body_pose,
+            left_hand_pose=left_hand_pose,
+            right_hand_pose=right_hand_pose,
+            transl=transl,
+            return_verts=True  # 返回顶点坐标
+        )
+        
+        vertices = output.vertices  # 3D顶点坐标 (1, N, 3)，N为顶点数
+        joints = output.joints      # 关节坐标 (1, K, 3)，K为关节数
+        
+        print("✅ 前向传播成功！")
+        print(f"输出顶点数量: {output.vertices.shape[1]}")
+        print(f"输出关节点数量: {output.joints.shape[1]}")
+        print(f"输出包含的键: {list(output.keys())}")
+        
+        print("\n🎉 SMPLH模型加载和测试完全成功！")
+        
+    except Exception as e:
+        print(f"❌ 加载或测试模型时出错: {e}")
+        import traceback
+        traceback.print_exc()
+else:
+    print(f"❌ 错误: 模型文件不存在 - {model_path}")
+    print("请检查文件路径是否正确")
 import matplotlib.pyplot as plt
 import os
 
