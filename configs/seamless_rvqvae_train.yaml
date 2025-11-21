@@ -1,0 +1,150 @@
+# Seamless数据集RVQ-VAE训练配置文件
+# 专为rvq_seamless_train.py训练脚本设计
+
+is_train: True
+ddp: False
+stat: ts
+root_path: ./
+out_path: ./outputs/seamless_audio2pose/
+project: seamless_s2g
+
+# 数据路径配置
+data_path: ./datasets/seamless_interaction/improvised/
+data_path_1: ./datasets/hub/
+dataset: seamless_sep
+cache_path: datasets/seamless_cache/seamless_smplh_64/
+new_cache: True
+
+# 运动配置 - 专为RVQ训练优化
+pose_rep: smplh
+ori_joints: seamless_smplh_joints
+tar_joints: seamless_smplh_full
+pose_norm: True
+pose_fps: 30
+rot6d: True
+pre_frames: 4
+pose_dims: 312
+pose_length: 64
+stride: 20
+test_length: 64
+multi_length_training: [1.0]  # 恢复单一长度训练
+motion_f: 256
+m_pre_encoder: null
+m_encoder: null
+m_fix_pre: False
+
+# 归一化文件路径 - 使用seamless数据集统计
+mean_pose_path: ./mean_std_seamless/seamless_2_312_mean.npy
+std_pose_path: ./mean_std_seamless/seamless_2_312_std.npy
+mean_trans_path: ./mean_std_seamless/seamless_2_trans_mean.npy
+std_trans_path: ./mean_std_seamless/seamless_2_trans_std.npy
+
+# 音频配置 (虽然RVQ训练不直接使用，但保持完整)
+audio_rep: onset+amplitude
+audio_sr: 16000
+audio_fps: 16000
+audio_norm: False
+audio_f: 256
+
+# 文本配置
+word_rep: textgrid
+word_index_num: 11195
+word_dims: 300
+freeze_wordembed: False
+word_f: 256
+t_pre_encoder: fasttext
+t_encoder: null
+t_fix_pre: False
+
+# 面部配置 (seamles主要是身体和手部)
+facial_rep: smplh
+facial_dims: 100
+facial_norm: False
+facial_f: 0
+f_pre_encoder: null
+f_encoder: null
+f_fix_pre: False
+
+# 说话者配置 (使用session ID)
+id_rep: onehot
+speaker_f: 0
+
+# 模型配置 - RVQ-VAE专用
+batch_size: 64               # 训练批次大小
+lr_base: 2e-4                # 基础学习率
+model: motion_representation
+g_name: VQVAEConvZero
+trainer: ae_total
+hidden_size: 768
+n_layer: 1
+
+# 训练配置
+rec_weight: 1
+grad_norm: 0.99
+epochs: 1000
+test_period: 20
+
+# 身体部位权重 (可能需要根据52关节调整)
+ll: 3      # lower body
+lf: 3      # feet
+lu: 3      # upper body
+lh: 3      # hands
+cl: 1      # lower body confidence
+cf: 0      # feet confidence
+cu: 1      # upper body confidence
+ch: 1      # hands confidence
+
+# RVQ-VAE核心配置 - 与训练脚本参数对应
+levels: 1
+downs_t: [2]
+strides_t : [2]
+emb_width : 512
+l_bins : 512
+l_mu : 0.99
+commit : 0.02                 # 对应训练脚本中的--commit参数
+hvqvae_multipliers : [1]
+width: 512
+depth: 3
+m_conv : 1.0
+dilation_growth_rate : 3
+sample_length: 80
+use_bottleneck: True
+joint_channel: 6              # 6D表示
+vel: 1                       # 速度特征
+acc: 1                       # 加速度特征
+vqvae_reverse_decoder_dilation: True
+
+# RVQ量化器配置
+num_quantizers: 6             # 对应训练脚本中的args.num_quantizers
+shared_codebook: False        # 对应训练脚本中的args.shared_codebook
+quantize_dropout_prob: 0.2    # 对应训练脚本中的args.quantize_dropout_prob
+
+# 训练优化配置
+total_iter: 80000             # 对应训练脚本中的--total-iter
+warm_up_iter: 400             # 对应训练脚本中的--warm-up-iter
+lr_scheduler: [50000, 200000, 400000]  # 对应训练脚本中的--lr-scheduler
+gamma: 0.05                   # 对应训练脚本中的--gamma
+weight_decay: 0.0             # 对应训练脚本中的--weight-decay
+loss_vel: 0.1                 # 对应训练脚本中的--loss-vel
+recons_loss: l1_smooth         # 对应训练脚本中的--recons-loss
+
+# VAE配置
+vae_length: 240
+vae_codebook_size: 256
+vae_layer: 4
+vae_grow: [1,1,2,1]
+variational: False
+
+# 数据清理配置
+disable_filtering: False     # 是否禁用数据过滤
+clean_first_seconds: 2       # 清理前2秒
+clean_final_seconds: 2       # 清理后2秒
+
+# 其他配置
+use_amass: False
+beat_align: False            # seamless数据集不使用beat对齐
+
+# 训练器特定的输出配置
+print_iter: 200              # 对应训练脚本中的--print-iter
+eval_iter: 1000              # 对应训练脚本中的--eval-iter
+seed: 123                    # 对应训练脚本中的--seed
