@@ -12,8 +12,8 @@ project: seamless_s2g
 data_path: ./datasets/seamless_interaction/improvised/
 data_path_1: ./datasets/hub/
 dataset: seamless_sep
-cache_path: datasets/seamless_cache/seamless_smplh_64/
-new_cache: True
+cache_path: datasets/seamless_cache/seamless_smplh_144/ #64 24
+new_cache: False
 
 # 运动配置 - 专为RVQ训练优化
 pose_rep: smplh
@@ -23,11 +23,13 @@ pose_norm: True
 pose_fps: 30
 rot6d: True
 pre_frames: 4
-pose_dims: 312
-pose_length: 64
-stride: 20
-test_length: 64
+# pose_dims: 312
+
+pose_length: 144 ##64 24
+stride: 45 #20 8
+test_length: 144 ##64 24
 multi_length_training: [1.0]  # 恢复单一长度训练
+
 motion_f: 256
 m_pre_encoder: null
 m_encoder: null

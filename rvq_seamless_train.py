@@ -244,7 +244,7 @@ logger.info(f"✅ 训练集缓存构建完成！样本数量: {len(trainSet.sele
 
 # 构建测试集缓存
 logger.info("🔄 正在构建测试集缓存...")
-testSet = CustomDataset(dataset_args,"test",build_cache = True)
+testSet = CustomDataset(dataset_args,"val",build_cache = True)
 logger.info(f"✅ 测试集缓存构建完成！样本数量: {len(testSet.selected_files)}")
 
 # 如果只是构建缓存，则直接退出
@@ -515,7 +515,7 @@ if args.mode == 'train':
 
                 # Check for early stopping
                 if len(l2_history) > early_stop_patience:
-                    if best_l2 <= min(l2_history[-early_stop_patience-1:-1]):
+                    if best_l2 <= min(l2_history[-early_stop_patience:]):
                         early_stop_counter += 1
                         logger.info(f"Early stopping counter: {early_stop_counter}/{early_stop_patience}")
                         if early_stop_counter >= early_stop_patience:

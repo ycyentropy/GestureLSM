@@ -63,7 +63,7 @@ class CustomDataset(Dataset):
         self.data_dir = args.data_path
         self.beatx_during_time = 0
 
-        if loader_type == "test":
+        if loader_type == "test" or loader_type == "val":
             self.args.multi_length_training = [1.0]
         self.max_length = int(args.pose_length * self.args.multi_length_training[-1])
         self.max_audio_pre_len = math.floor(args.pose_length / args.pose_fps * self.args.audio_sr)
@@ -251,7 +251,7 @@ class CustomDataset(Dataset):
 
         # Build cache if needed (not exists or needs rebuild)
         if not os.path.exists(preloaded_dir) or cache_needs_rebuild:
-            if self.loader_type == "test":
+            if self.loader_type == "test" or self.loader_type == "val":
                 self.cache_generation(
                     preloaded_dir, True,
                     0, 0,
@@ -463,7 +463,7 @@ class CustomDataset(Dataset):
                 tar_pose = (tar_pose - self.mean) / self.std
                 trans_v = (trans_v - self.trans_mean) / self.trans_std
 
-            if self.loader_type == "test":
+            if self.loader_type == "test" or self.loader_type == "val":
                 tar_pose = tar_pose.float()
                 trans = torch.from_numpy(trans).float()
                 trans_v = torch.from_numpy(trans_v).float()
