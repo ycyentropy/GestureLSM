@@ -176,7 +176,7 @@ def get_args_parser():
     ## other
     parser.add_argument('--print-iter', default=100, type=int, help='print frequency')
     parser.add_argument('--eval-iter', default=1000, type=int, help='evaluation frequency')
-    parser.add_argument('--seed', default=123, type=int, help='seed for initializing training.')
+    parser.add_argument('--seed', default=123, type=int, help='123 seed for initializing training.')
 
     parser.add_argument('--vis-gt', action='store_true', help='whether visualize GT motions')
     parser.add_argument('--nb-vis', default=20, type=int, help='nb of visualizations')
