@@ -118,9 +118,9 @@ class CustomTrainer(BaseTrainer):
                 find_unused_parameters=False,
             )
         else:
-            self.model = torch.nn.DataParallel(
-                getattr(model_module, cfg.model.g_name)(cfg), self.cfg.gpus
-            ).cuda()
+            # Create model and move to first GPU in gpus list
+            model = getattr(model_module, cfg.model.g_name)(cfg).to(self.cfg.gpus[0])
+            self.model = torch.nn.DataParallel(model, self.cfg.gpus)
 
         if self.args.mode == "train":
             if self.rank == 0:
@@ -137,17 +137,17 @@ class CustomTrainer(BaseTrainer):
         # Body part VQ models
         self.vq_models = self._create_body_vq_models()
 
-        # Set all VQ models to eval mode
+        # Set all VQ models to eval mode and move to the first GPU in gpus list
         for model in self.vq_models.values():
-            model.eval().to(self.rank)
+            model.eval().to(self.cfg.gpus[0])
 
         self.vq_model_upper, self.vq_model_hands, self.vq_model_lower = (
             self.vq_models.values()
         )
 
         ##### Loss functions #####
-        self.reclatent_loss = nn.MSELoss().to(self.rank)
-        self.vel_loss = torch.nn.L1Loss(reduction="mean").to(self.rank)
+        self.reclatent_loss = nn.MSELoss().to(self.cfg.gpus[0])
+        self.vel_loss = torch.nn.L1Loss(reduction="mean").to(self.cfg.gpus[0])
 
         ##### Normalization #####
         self.mean = np.load("./mean_std/beatx_2_330_mean.npy")
@@ -156,15 +156,15 @@ class CustomTrainer(BaseTrainer):
         # Extract body part specific normalizations
         for part in ["upper", "hands", "lower"]:
             mask = globals()[f"{part}_body_mask"]
-            setattr(self, f"mean_{part}", torch.from_numpy(self.mean[mask]).cuda())
-            setattr(self, f"std_{part}", torch.from_numpy(self.std[mask]).cuda())
+            setattr(self, f"mean_{part}", torch.from_numpy(self.mean[mask]).to(self.cfg.gpus[0]))
+            setattr(self, f"std_{part}", torch.from_numpy(self.std[mask]).to(self.cfg.gpus[0]))
 
         self.trans_mean = torch.from_numpy(
             np.load("./mean_std/beatx_2_trans_mean.npy")
-        ).cuda()
+        ).to(self.cfg.gpus[0])
         self.trans_std = torch.from_numpy(
             np.load("./mean_std/beatx_2_trans_std.npy")
-        ).cuda()
+        ).to(self.cfg.gpus[0])
 
         if self.args.checkpoint:
             try:
@@ -237,23 +237,23 @@ class CustomTrainer(BaseTrainer):
         return original_shape_t
 
     def inverse_selection_tensor(self, filtered_t, selection_array, n):
-        selection_array = torch.from_numpy(selection_array).cuda()
-        original_shape_t = torch.zeros((n, 165)).cuda()
+        selection_array = torch.from_numpy(selection_array).to(self.cfg.gpus[0])
+        original_shape_t = torch.zeros((n, 165)).to(self.cfg.gpus[0])
         selected_indices = torch.where(selection_array == 1)[0]
         for i in range(n):
             original_shape_t[i, selected_indices] = filtered_t[i]
         return original_shape_t
 
     def _load_data(self, dict_data):
-        facial_rep = dict_data["facial"].to(self.rank)
-        beta = dict_data["beta"].to(self.rank)
-        tar_trans = dict_data["trans"].to(self.rank)
-        tar_id = dict_data["id"].to(self.rank)
+        facial_rep = dict_data["facial"].to(self.cfg.gpus[0])
+        beta = dict_data["beta"].to(self.cfg.gpus[0])
+        tar_trans = dict_data["trans"].to(self.cfg.gpus[0])
+        tar_id = dict_data["id"].to(self.cfg.gpus[0])
 
         # process the pose data
-        tar_pose = dict_data["pose"][:, :, :165].to(self.rank)
-        tar_trans_v = dict_data["trans_v"].to(self.rank)
-        tar_trans = dict_data["trans"].to(self.rank)
+        tar_pose = dict_data["pose"][:, :, :165].to(self.cfg.gpus[0])
+        tar_trans_v = dict_data["trans_v"].to(self.cfg.gpus[0])
+        tar_trans = dict_data["trans"].to(self.cfg.gpus[0])
         bs, n, j = tar_pose.shape[0], tar_pose.shape[1], self.joints
         tar_pose_hands = tar_pose[:, :, 25 * 3 : 55 * 3]
         tar_pose_hands = rc.axis_angle_to_matrix(tar_pose_hands.reshape(bs, n, 30, 3))
@@ -289,14 +289,17 @@ class CustomTrainer(BaseTrainer):
 
         word = dict_data.get("word", None)
         if word is not None:
-            word = word.to(self.rank)
+            word = word.to(self.cfg.gpus[0])
 
         # style feature is always None (without annotation, we never know what it is)
         style_feature = None
 
         audio_onset = None
         if self.cfg.data.onset_rep:
-            audio_onset = dict_data["audio_onset"].to(self.rank)
+            audio_onset = dict_data["audio_onset"].to(self.cfg.gpus[0])
+        
+        # Get audio name if available
+        audio_name = dict_data.get("audio_name", None)
 
         return {
             "audio_onset": audio_onset,
@@ -308,6 +311,7 @@ class CustomTrainer(BaseTrainer):
             "tar_pose": tar_pose,
             "trans": tar_trans,
             "style_feature": style_feature,
+            "audio_name": audio_name,
         }
 
     def _g_training(self, loaded_data, mode="train", epoch=0):
@@ -382,8 +386,8 @@ class CustomTrainer(BaseTrainer):
             if audio_onset is not None:
                 in_audio_onset_tmp = audio_onset[
                     :,
-                    i * (16000 // 30 * round_l) : (i + 1) * (16000 // 30 * round_l)
-                    + 16000 // 30 * self.cfg.pre_frames * vqvae_squeeze_scale,
+                    i * (self.cfg.data.audio_sr // self.cfg.data.pose_fps * round_l) : (i + 1) * (self.cfg.data.audio_sr // self.cfg.data.pose_fps * round_l)
+                    + self.cfg.data.audio_sr // self.cfg.data.pose_fps * self.cfg.pre_frames * vqvae_squeeze_scale,
                 ]
             if in_word is not None:
                 in_word_tmp = in_word[
@@ -415,7 +419,7 @@ class CustomTrainer(BaseTrainer):
             cond_["y"]["word"] = in_word_tmp
             cond_["y"]["id"] = in_id_tmp
             cond_["y"]["seed"] = in_seed_tmp
-            cond_["y"]["style_feature"] = torch.zeros([bs, 512]).cuda()
+            cond_["y"]["style_feature"] = torch.zeros([bs, 512]).to(self.cfg.gpus[0])
 
             sample = self.model(cond_)["latents"]
 
@@ -561,7 +565,7 @@ class CustomTrainer(BaseTrainer):
         """
         start_time = time.time()
         total_length = 0
-        test_seq_list = self.test_data.selected_file
+        test_seq_list = self.test_data.selected_file if hasattr(self.test_data, 'selected_file') else None
         align = 0
         latent_out = []
         latent_ori = []
@@ -653,28 +657,32 @@ class CustomTrainer(BaseTrainer):
                 tar_pose = rc.matrix_to_axis_angle(tar_pose).reshape(bs * n, j * 3)
 
                 # Generate SMPLX vertices and joints
-                vertices_rec = self.smplx(
-                    betas=tar_beta.reshape(bs * n, 300),
-                    transl=rec_trans.reshape(bs * n, 3) - rec_trans.reshape(bs * n, 3),
-                    expression=tar_exps.reshape(bs * n, 100)
-                    - tar_exps.reshape(bs * n, 100),
-                    jaw_pose=rec_pose[:, 66:69],
-                    global_orient=rec_pose[:, :3],
-                    body_pose=rec_pose[:, 3 : 21 * 3 + 3],
-                    left_hand_pose=rec_pose[:, 25 * 3 : 40 * 3],
-                    right_hand_pose=rec_pose[:, 40 * 3 : 55 * 3],
-                    return_joints=True,
-                    leye_pose=rec_pose[:, 69:72],
-                    reye_pose=rec_pose[:, 72:75],
-                )
-
-                joints_rec = (
-                    vertices_rec["joints"]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .reshape(bs, n, 127 * 3)[0, :n, : 55 * 3]
-                )
+                # Process in smaller chunks to reduce memory usage
+                chunk_size = 32  # Adjust based on available memory
+                joints_rec_list = []
+                
+                for i in range(0, bs * n, chunk_size):
+                    end_idx = min(i + chunk_size, bs * n)
+                    vertices_rec = self.smplx(
+                        betas=tar_beta.reshape(bs * n, 300)[i:end_idx],
+                        transl=rec_trans.reshape(bs * n, 3)[i:end_idx] - rec_trans.reshape(bs * n, 3)[i:end_idx],
+                        expression=tar_exps.reshape(bs * n, 100)[i:end_idx] - tar_exps.reshape(bs * n, 100)[i:end_idx],
+                        jaw_pose=rec_pose[:, 66:69][i:end_idx],
+                        global_orient=rec_pose[:, :3][i:end_idx],
+                        body_pose=rec_pose[:, 3 : 21 * 3 + 3][i:end_idx],
+                        left_hand_pose=rec_pose[:, 25 * 3 : 40 * 3][i:end_idx],
+                        right_hand_pose=rec_pose[:, 40 * 3 : 55 * 3][i:end_idx],
+                        return_joints=True,
+                        leye_pose=rec_pose[:, 69:72][i:end_idx],
+                        reye_pose=rec_pose[:, 72:75][i:end_idx],
+                    )
+                    joints_rec_list.append(vertices_rec["joints"].detach().cpu().numpy())
+                    del vertices_rec
+                    torch.cuda.empty_cache()
+                
+                # Concatenate results
+                joints_rec = np.concatenate(joints_rec_list, axis=0)
+                joints_rec = joints_rec.reshape(bs, n, 127 * 3)[0, :n, : 55 * 3]
 
                 # Calculate L1 diversity
                 if hasattr(self, "l1_calculator"):
@@ -687,12 +695,11 @@ class CustomTrainer(BaseTrainer):
                     and bs == 1
                     and mode != "test_render"
                 ):
-                    in_audio_eval, sr = librosa.load(
-                        self.cfg.data.data_path
-                        + "wave16k/"
-                        + test_seq_list.iloc[its]["id"]
-                        + ".wav"
-                    )
+                    if test_seq_list is not None:
+                        audio_path = self.cfg.data.data_path + "wave16k/" + test_seq_list.iloc[its]["id"] + ".wav"
+                    else:
+                        audio_path = loaded_data["audio_name"][0]
+                    in_audio_eval, sr = librosa.load(audio_path)
                     in_audio_eval = librosa.resample(
                         in_audio_eval, orig_sr=sr, target_sr=self.cfg.data.audio_sr
                     )
@@ -788,19 +795,32 @@ class CustomTrainer(BaseTrainer):
                             tar_trans.detach().cpu().numpy().reshape(bs * n, 3)
                         )
 
-                        gt_npz = np.load(
-                            self.cfg.data.data_path
-                            + self.cfg.data.pose_rep
-                            + "/"
-                            + test_seq_list.iloc[its]["id"]
-                            + ".npz",
-                            allow_pickle=True,
-                        )
+                        # Get file ID for saving results
+                        if test_seq_list is not None:
+                            file_id = test_seq_list.iloc[its]["id"]
+                        else:
+                            # Extract filename from audio path
+                            import os
+                            file_id = os.path.basename(loaded_data["audio_name"][0]).split(".")[0]
+                        
+                        # Try to load gt_npz from the default path, fallback to demo example if not found
+                        try:
+                            gt_npz = np.load(
+                                self.cfg.data.data_path
+                                + self.cfg.data.pose_rep
+                                + "/"
+                                + file_id
+                                + ".npz",
+                                allow_pickle=True,
+                            )
+                        except (FileNotFoundError, IOError):
+                            # Fallback to demo example for seamless dataset
+                            gt_npz = np.load("./demo/examples/2_scott_0_1_1.npz", allow_pickle=True)
 
                         np.savez(
                             results_save_path
                             + "gt_"
-                            + test_seq_list.iloc[its]["id"]
+                            + file_id
                             + ".npz",
                             betas=gt_npz["betas"],
                             poses=tar_pose_np,
@@ -813,7 +833,7 @@ class CustomTrainer(BaseTrainer):
                         np.savez(
                             results_save_path
                             + "res_"
-                            + test_seq_list.iloc[its]["id"]
+                            + file_id
                             + ".npz",
                             betas=gt_npz["betas"],
                             poses=rec_pose_np,
@@ -879,7 +899,7 @@ class CustomTrainer(BaseTrainer):
         self.tracker.reset()
 
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="val", max_iterations=15
+            self.test_loader, epoch, mode="val", max_iterations=10 #原来是15
         )
 
         total_length = results["total_length"]

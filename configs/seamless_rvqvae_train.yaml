@@ -12,7 +12,7 @@ project: seamless_s2g
 data_path: ./datasets/seamless_interaction/improvised/
 data_path_1: ./datasets/hub/
 dataset: seamless_sep
-cache_path: datasets/seamless_cache/seamless_smplh_144/ #64 24
+cache_path: datasets/seamless_cache/seamless_smplh_64/ #64 24 144
 new_cache: False
 
 # 运动配置 - 专为RVQ训练优化
@@ -25,9 +25,9 @@ rot6d: True
 pre_frames: 4
 # pose_dims: 312
 
-pose_length: 144 ##64 24
-stride: 45 #20 8
-test_length: 144 ##64 24
+pose_length: 64 ##64 24 144
+stride: 20 #20 8 45
+test_length: 64 ##64 24 144
 multi_length_training: [1.0]  # 恢复单一长度训练
 
 motion_f: 256
@@ -38,9 +38,8 @@ m_fix_pre: False
 # 归一化文件路径 - 使用seamless数据集统计
 mean_pose_path: ./mean_std_seamless/seamless_2_312_mean.npy
 std_pose_path: ./mean_std_seamless/seamless_2_312_std.npy
-mean_trans_path: ./mean_std_seamless/seamless_2_trans_mean.npy
-std_trans_path: ./mean_std_seamless/seamless_2_trans_std.npy
-
+mean_trans_path: ./trans_stats/trans_mean.npy
+std_trans_path: ./trans_stats/trans_std.npy
 # 音频配置 (虽然RVQ训练不直接使用，但保持完整)
 audio_rep: onset+amplitude
 audio_sr: 16000

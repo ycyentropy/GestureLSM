@@ -50,14 +50,30 @@ def calculate_timing_info(audio_data, facial_data, round_seconds_skeleton,
                          audio_fps, pose_fps, audio_sr, audio_rep):
     """Calculate timing information for the data."""
     if audio_data is not None:
-        if audio_rep != "wave16k":
-            round_seconds_audio = len(audio_data) // audio_fps
+        # 正确计算不同音频表示的时间
+        if audio_rep == "wave16k" or audio_rep == "wave48k":
+            # 原始音频：使用采样率计算秒数
+            round_seconds_audio = audio_data.shape[0] // audio_sr
+        elif audio_rep == "onset+amplitude":
+            # onset+amplitude 特征：每个采样点对应一个值，使用采样率计算秒数
+            round_seconds_audio = audio_data.shape[0] // audio_sr
         elif audio_rep == "mfcc":
+            # MFCC 特征：每个值对应一个时间帧，使用帧率计算秒数
             round_seconds_audio = audio_data.shape[0] // audio_fps
         else:
-            round_seconds_audio = audio_data.shape[0] // audio_sr
+            # 默认：假设是特征数据，使用帧率计算秒数
+            round_seconds_audio = audio_data.shape[0] // audio_fps
             
+        # Check if facial_data is valid (not a placeholder)
+        is_facial_valid = False
         if facial_data is not None:
+            # Check if facial_data is not just a placeholder [-1]
+            if isinstance(facial_data, np.ndarray) and facial_data.shape[0] > 1:
+                is_facial_valid = True
+            elif isinstance(facial_data, np.ndarray) and facial_data.shape[0] == 1 and facial_data[0] != -1:
+                is_facial_valid = True
+        
+        if is_facial_valid:
             round_seconds_facial = facial_data.shape[0] // pose_fps
             logger.info(f"audio: {round_seconds_audio}s, pose: {round_seconds_skeleton}s, facial: {round_seconds_facial}s")
             final_seconds = min(round_seconds_audio, round_seconds_skeleton, round_seconds_facial)
@@ -65,7 +81,7 @@ def calculate_timing_info(audio_data, facial_data, round_seconds_skeleton,
             if final_seconds != max_round:
                 logger.warning(f"reduce to {final_seconds}s, ignore {max_round-final_seconds}s")
         else:
-            logger.info(f"pose: {round_seconds_skeleton}s, audio: {round_seconds_audio}s")
+            logger.info(f"audio: {round_seconds_audio}s, pose: {round_seconds_skeleton}s, facial: None (invalid)")
             final_seconds = min(round_seconds_audio, round_seconds_skeleton)
             max_round = max(round_seconds_audio, round_seconds_skeleton)
             if final_seconds != max_round:
@@ -114,9 +130,12 @@ def process_data_with_ratio(ori_stride, ori_length, ratio, clip_info, args, is_t
     logger.info(f"pose from frame {clip_info['clip_s_f_pose']} to {clip_info['clip_e_f_pose']}, length {cut_length}")
     logger.info(f"{num_subdivision} clips is expected with stride {args.stride}")
     
+    # Calculate audio short length even if audio_data is None
     if audio_data is not None:
         audio_short_length = math.floor(cut_length / args.pose_fps * args.audio_fps)
         logger.info(f"audio from frame {clip_info['clip_s_f_audio']} to {clip_info['clip_e_f_audio']}, length {audio_short_length}")
+    else:
+        audio_short_length = -1  # Default value when audio_data is None
     
     # Process subdivisions
     filtered_counts = defaultdict(int)
@@ -152,16 +171,23 @@ def extract_sample_data(idx, clip_info, cut_length, args,
     start_idx = clip_info['clip_s_f_pose'] + idx * args.stride
     fin_idx = start_idx + cut_length
     
+    # Check if attributes exist in args
+    has_facial_rep = hasattr(args, 'facial_rep')
+    has_word_rep = hasattr(args, 'word_rep')
+    has_emo_rep = hasattr(args, 'emo_rep')
+    has_sem_rep = hasattr(args, 'sem_rep')
+    has_id_rep = hasattr(args, 'id_rep')
+    
     sample_data = {
         'pose': pose_data[start_idx:fin_idx],
         'trans': trans_data[start_idx:fin_idx],
         'trans_v': trans_v_data[start_idx:fin_idx],
         'shape': shape_data[start_idx:fin_idx],
-        'facial': facial_data[start_idx:fin_idx] if args.facial_rep is not None else np.array([-1]),
-        'word': word_data[start_idx:fin_idx] if args.word_rep is not None else np.array([-1]),
-        'emo': emo_data[start_idx:fin_idx] if args.emo_rep is not None else np.array([-1]),
-        'sem': sem_data[start_idx:fin_idx] if args.sem_rep is not None else np.array([-1]),
-        'vid': vid_data[start_idx:fin_idx] if args.id_rep is not None else np.array([-1]),
+        'facial': facial_data[start_idx:fin_idx] if (has_facial_rep and args.facial_rep is not None) else np.array([-1]),
+        'word': word_data[start_idx:fin_idx] if (has_word_rep and args.word_rep is not None) else np.array([-1]),
+        'emo': emo_data[start_idx:fin_idx] if (has_emo_rep and args.emo_rep is not None) else np.array([-1]),
+        'sem': sem_data[start_idx:fin_idx] if (has_sem_rep and args.sem_rep is not None) else np.array([-1]),
+        'vid': vid_data[start_idx:fin_idx] if (has_id_rep and args.id_rep is not None) else np.array([-1]),
         'audio_name': audio_file
     }
     

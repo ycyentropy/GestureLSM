@@ -132,7 +132,7 @@ def get_args_parser():
     parser.add_argument('--dataname', type=str, default='seamless', help='dataset directory')
     parser.add_argument('--batch-size', default=4096, type=int, help='batch size')
     parser.add_argument('--window-size', type=int, default=64, help='training motion length')
-    parser.add_argument('--body_part',type=str,default='whole', help='body part: whole, upper, lower, hands')
+    parser.add_argument('--body_part',type=str,default='whole', help='body part: whole, upper, lower, lower_trans, hands')
     ## optimization
     parser.add_argument('--total-iter', default=50000, type=int, help='number of total iterations to run')
     parser.add_argument('--warm-up-iter', default=1000, type=int, help='number of total iterations for warmup')
@@ -176,7 +176,7 @@ def get_args_parser():
     ## other
     parser.add_argument('--print-iter', default=100, type=int, help='print frequency')
     parser.add_argument('--eval-iter', default=1000, type=int, help='evaluation frequency')
-    parser.add_argument('--seed', default=123, type=int, help='123 seed for initializing training.')
+    parser.add_argument('--seed', default=0, type=int, help='123 seed for initializing training.')
 
     parser.add_argument('--vis-gt', action='store_true', help='whether visualize GT motions')
     parser.add_argument('--nb-vis', default=20, type=int, help='nb of visualizations')
@@ -286,7 +286,8 @@ if args.body_part == "upper":
     rec_mask = list(range(len(mask)))
 
 elif args.body_part == "hands":
-    # 手部：30个关节点 (22-51)
+    # 手部：30个关节点 (22-51) ,修改了一下，从25开始
+    # joints = list(range(25, 55))
     joints = list(range(22, 52))
     hands_body_mask = []
     for i in joints:
@@ -303,9 +304,20 @@ elif args.body_part == "lower":
     mask = lower_body_mask
     rec_mask = list(range(len(mask)))
 
+elif args.body_part == "lower_trans":
+    # 下半身带平移：9个关节点 + 3个平移维度
+    joints = [0, 1, 2, 4, 5, 7, 8, 10, 11]
+    lower_body_mask = []
+    for i in joints:
+        lower_body_mask.extend([i*6, i*6+1, i*6+2, i*6+3, i*6+4, i*6+5])
+    lower_body_mask.extend([312, 313, 314])  # 添加平移维度
+    mask = lower_body_mask
+    rec_mask = list(range(len(mask)))
+
 elif args.body_part == "whole":
-    # 全部52个关节点
-    joints = list(range(52))
+    # 全部52个关节点 注意我在这里进行了修改，将22-55的关节点空缺，只保留0-21和25-54
+    # joints = list(range(0,22))+list(range(25,55))
+    joints = list(range(0,52))
     whole_body_mask = []
     for i in joints:
         whole_body_mask.extend([i*6, i*6+1, i*6+2, i*6+3, i*6+4, i*6+5])
@@ -321,6 +333,8 @@ elif args.body_part == "hands":
     dim_pose = len(joints) * 6   # 30 * 6 = 180
 elif args.body_part == "lower":
     dim_pose = len(joints) * 6   # 9 * 6 = 54
+elif args.body_part == "lower_trans":
+    dim_pose = len(joints) * 6 + 3  # 9 * 6 + 3 = 57 (包含平移维度)
 elif args.body_part == "whole":
     dim_pose = len(joints) * 6   # 52 * 6 = 312
 
@@ -355,8 +369,10 @@ mean_pose = np.load(mean_pose_path)
 std_pose = np.load(std_pose_path)
 
 # 裁剪到对应的身体部位
-mean_pose = torch.from_numpy(mean_pose[mask]).to(device)
-std_pose = torch.from_numpy(std_pose[mask]).to(device)
+# mean_pose = torch.from_numpy(mean_pose[mask]).to(device)
+# std_pose = torch.from_numpy(std_pose[mask]).to(device)
+mean_pose = torch.from_numpy(mean_pose).to(device)
+std_pose = torch.from_numpy(std_pose).to(device)
 
 logger.info(f"Loaded normalization: mean_pose.shape={mean_pose.shape}, std_pose.shape={std_pose.shape}")
 
@@ -380,10 +396,29 @@ if args.mode == 'train':
         optimizer, current_lr = update_lr_warm_up(optimizer, nb_iter, args.warm_up_iter, args.lr)
 
         gt_motion = next(train_loader_iter)
-
+        
+        # # 打印处理前后的数据维度
+        # print(f"[DEBUG] 原始gt_motion维度: {gt_motion.shape}")
+        
         gt_motion = gt_motion[...,mask].to(device).float() # (bs, 64, dim)
+        
+        # print(f"[DEBUG] 应用mask后gt_motion维度: {gt_motion.shape}")
+        # print(f"[DEBUG] mask长度: {len(mask)}, mask内容: {mask[:10]}...{mask[-10:]}")
 
         pred_motion, loss_commit, perplexity = net(gt_motion).values()
+        
+        # 打印网络输出值
+        # 只有当loss_commit大于1时才打印
+        if loss_commit.item() > 1:
+            print(f"[DEBUG] loss_commit值: {loss_commit.item()}")
+            # 计算最后三个索引的均值
+            mean_last_three = gt_motion[..., -3:].mean()
+            print(f"[DEBUG] 最后三个索引的均值: {mean_last_three.item()}")
+            # 计算每个索引的均值
+            for i in range(3):
+                idx = -3 + i
+                mean_idx = gt_motion[..., idx].mean()
+                print(f"[DEBUG] 索引 {idx} 的均值: {mean_idx.item()}")
         loss_motion = Loss.my_forward(pred_motion, gt_motion,rec_mask)
         # 选择损失函数类型 - 暂时注释掉jitter和velocity损失
         # if args.use_jitter_loss:
@@ -500,8 +535,8 @@ if args.mode == 'train':
                     n = rec_motion.shape[1]
 
                     # 简化重建 - 只应用反归一化到掩码部分
-                    rec_motion_part = rec_motion[..., mask] * std_pose + mean_pose
-                    gt_motion_part = gt_ori[..., mask] * std_pose + mean_pose
+                    rec_motion_part = rec_motion[..., :-103] * std_pose + mean_pose #把mask改成:-103
+                    gt_motion_part = gt_ori[..., :-103] * std_pose + mean_pose
 
                     # 计算L2距离
                     l2_batch = torch.sqrt(torch.sum(diff ** 2, dim=[1, 2])).mean().item()
@@ -585,8 +620,8 @@ else:
             n = rec_motion.shape[1]
 
             # 简化重建 - 只应用反归一化到掩码部分
-            rec_motion_part = rec_motion[..., mask] * std_pose + mean_pose
-            gt_motion_part = gt_ori[..., mask] * std_pose + mean_pose
+            rec_motion_part = rec_motion[..., :-103] * std_pose + mean_pose #把mask改成:-103
+            gt_motion_part = gt_ori[..., :-103] * std_pose + mean_pose
 
             l2_batch = torch.sqrt(torch.sum(diff ** 2, dim=[1, 2])).mean().item()
             l2_all += l2_batch

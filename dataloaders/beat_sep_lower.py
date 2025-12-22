@@ -71,9 +71,9 @@ class CustomDataset(Dataset):
         self._init_data_paths()
 
         if self.args.beat_align:
-            if not os.path.exists(args.data_path+f"weights/mean_vel_{args.pose_rep}.npy"):
-                self.calculate_mean_velocity(args.data_path+f"weights/mean_vel_{args.pose_rep}.npy")
-            self.avg_vel = np.load(args.data_path+f"weights/mean_vel_{args.pose_rep}.npy")
+            if not os.path.exists(self.args.data_path+f"weights/mean_vel_{self.args.pose_rep}.npy"):
+                self.calculate_mean_velocity(self.args.data_path+f"weights/mean_vel_{self.args.pose_rep}.npy")
+            self.avg_vel = np.load(self.args.data_path+f"weights/mean_vel_{self.args.pose_rep}.npy")
         
         # Build or load cache
         self._init_cache(build_cache)
@@ -128,16 +128,22 @@ class CustomDataset(Dataset):
             self.build_cache(self.preloaded_dir)
         
         # In DDP mode, ensure all processes wait for cache building to complete
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        try:
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+        except Exception as e:
+            logger.warning(f"Distributed barrier failed (likely not in DDP mode): {e}")
         
         # Try to regenerate cache if corrupted (only on rank 0 to avoid race conditions)
         if self.rank == 0:
             self.regenerate_cache_if_corrupted()
         
         # Wait for cache regeneration to complete
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        try:
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+        except Exception as e:
+            logger.warning(f"Distributed barrier failed (likely not in DDP mode): {e}")
         
         self.load_db_mapping()
     

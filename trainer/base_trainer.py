@@ -51,8 +51,11 @@ class BaseTrainer(object):
         }
               
         self.train_data = init_class(cfg.data.name_pyfile, cfg.data.class_name, cfg.data, loader_type='train')
-        self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.train_data)
-        self.train_loader = DataLoader(self.train_data, batch_size=cfg.data.train_bs, sampler=self.train_sampler, drop_last=True, num_workers=4)
+        if cfg.ddp:
+            self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.train_data)
+            self.train_loader = DataLoader(self.train_data, batch_size=cfg.data.train_bs, sampler=self.train_sampler, drop_last=True, num_workers=4)
+        else:
+            self.train_loader = DataLoader(self.train_data, batch_size=cfg.data.train_bs, drop_last=True, num_workers=4)
         
         if cfg.data.test_clip:
             # test data for test_clip, only used for test_clip_fgd
@@ -63,6 +66,9 @@ class BaseTrainer(object):
         test_data_cfg = cfg.data.copy()
         test_data_cfg.test_clip = False
         self.test_data = init_class(cfg.data.name_pyfile, cfg.data.class_name, test_data_cfg, loader_type='test')
+        # Use val_bs if available, otherwise default to 1
+        val_batch_size = cfg.data.get('val_bs', 1)
+        # For test data, we need to use batch_size=1 because audio lengths vary
         self.test_loader = DataLoader(self.test_data, batch_size=1, drop_last=False)
         
         
@@ -95,7 +101,8 @@ class BaseTrainer(object):
         eval_args.data_path_1 = "./datasets/hub/"
         eval_args.vae_grow = [1,1,2,1]
         
-        eval_copy = getattr(eval_model_module, 'VAESKConv')(eval_args).to(self.rank)
+        # Use the first GPU in gpus list for eval_copy model
+        eval_copy = getattr(eval_model_module, 'VAESKConv')(eval_args).to(self.cfg.gpus[0])
         other_tools.load_checkpoints(
             eval_copy, 
             './datasets/BEAT_SMPL/beat_v2.0.0/beat_english_v2.0.0/weights/AESKConv_240_100.bin', 
@@ -113,7 +120,7 @@ class BaseTrainer(object):
             num_expression_coeffs=100, 
             ext='npz',
             use_pca=False,
-        ).to(self.rank).eval()
+        ).to(self.cfg.gpus[0]).eval()
         
         self.alignmenter = metric.alignment(0.3, 7, self.train_data.avg_vel, upper_body=[3,6,9,12,13,14,15,16,17,18,19,20,21]) if self.rank == 0 else None
         self.align_mask = 60

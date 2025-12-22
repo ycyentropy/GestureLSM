@@ -4,14 +4,14 @@
 # 训练不同人体部位的RVQ-VAE模型
 
 # 默认参数设置
-BATCH_SIZE=4096
+BATCH_SIZE=1024
 WINDOW_SIZE=64
 CODE_DIM=128
 NB_CODE=1024
 EXP_NAME=""  # 将在后面根据其他参数自动生成
 GPU_ID=0
 SLEEP_TIME=10
-PARTS="lower upper hands"  # 默认训练的身体部位
+PARTS="lower_trans upper hands"  # 默认训练的身体部位
 
 # 帮助信息
 show_help() {
@@ -83,7 +83,7 @@ fi
 
 # 人体部位列表和对应的中文描述
 declare -A BODY_PARTS
-BODY_PARTS["lower"]="下半身"
+BODY_PARTS["lower_trans"]="下半身带平移"
 BODY_PARTS["upper"]="上半身"
 BODY_PARTS["hands"]="手部"
 

@@ -17,11 +17,11 @@ import torch.distributed as dist
 import librosa
 import smplx
 
-from .build_vocab import Vocab
-from .utils.audio_features import Wav2Vec2Model
+# from .build_vocab import Vocab
+# from .utils.audio_features import Wav2Vec2Model
 from .data_tools import joints_list
 from .utils import rotation_conversions as rc
-from .utils import other_tools
+# from .utils import other_tools
 
 class CustomDataset(Dataset):
     def __init__(self, args, loader_type, augmentation=None, kwargs=None, build_cache=True):
@@ -94,8 +94,8 @@ class CustomDataset(Dataset):
         self.mean = np.load('./mean_std_seamless/seamless_2_312_mean.npy')
         self.std = np.load('./mean_std_seamless/seamless_2_312_std.npy')
 
-        self.trans_mean = np.load('./mean_std_seamless/seamless_2_trans_mean.npy')
-        self.trans_std = np.load('./mean_std_seamless/seamless_2_trans_std.npy')
+        self.trans_mean = np.load('./trans_stats/trans_mean.npy')
+        self.trans_std = np.load('./trans_stats/trans_std.npy')
 
     def _scan_seamless_directory(self):
         """扫描seamless数据集的三层目录结构"""
@@ -141,10 +141,28 @@ class CustomDataset(Dataset):
                 body_pose = m_data["smplh:body_pose"].reshape(-1, 63)          # [N, 21, 3] -> [N, 63]
                 left_hand_pose = m_data["smplh:left_hand_pose"].reshape(-1, 45)  # [N, 15, 3] -> [N, 45]
                 right_hand_pose = m_data["smplh:right_hand_pose"].reshape(-1, 45) # [N, 15, 3] -> [N, 45]
-                # Seamless数据集没有betas字段，使用零向量
-                betas = np.zeros((1, 10), dtype=np.float32)         # [1, 10]
                 trans = m_data["smplh:translation"]           # [N, 3]
-
+                
+                # 初始化有效性标记
+                N = global_orient.shape[0]
+                is_valid = np.ones(N, dtype=bool)
+                
+                # 如果存在smplh:is_valid键，使用该键的标记
+                if "smplh:is_valid" in m_data:
+                    is_valid &= m_data["smplh:is_valid"]
+                
+                # 必须对平移数据进行异常值检测
+                # 使用新的阈值检测方法，范围在-100到100之间
+                trans_is_valid = self.detect_translation_outliers_threshold(trans)
+                is_valid &= trans_is_valid
+                
+                # 对所有姿态参数进行平滑处理
+                global_orient = self.smooth_outliers(global_orient, is_valid)
+                body_pose = self.smooth_outliers(body_pose, is_valid)
+                left_hand_pose = self.smooth_outliers(left_hand_pose, is_valid)
+                right_hand_pose = self.smooth_outliers(right_hand_pose, is_valid)
+                trans = self.smooth_outliers(trans, is_valid)
+                
                 n_frames = global_orient.shape[0]
 
                 # 组装完整的姿态向量 (156维)
@@ -296,11 +314,38 @@ class CustomDataset(Dataset):
                 stride = int(30/self.args.pose_fps)
 
                 # 提取姿态参数
-                global_orient = pose_data["smplh:global_orient"][::stride]  # [N, 3]
-                body_pose = pose_data["smplh:body_pose"][::stride].reshape(-1, 63)          # [N, 21, 3] -> [N, 63]
-                left_hand_pose = pose_data["smplh:left_hand_pose"][::stride].reshape(-1, 45)  # [N, 15, 3] -> [N, 45]
-                right_hand_pose = pose_data["smplh:right_hand_pose"][::stride].reshape(-1, 45) # [N, 15, 3] -> [N, 45]
-                translation = pose_data["smplh:translation"][::stride]      # [N, 3]
+                global_orient_full = pose_data["smplh:global_orient"]  # [N, 3]
+                body_pose_full = pose_data["smplh:body_pose"]  # [N, 21, 3]
+                left_hand_pose_full = pose_data["smplh:left_hand_pose"]  # [N, 15, 3]
+                right_hand_pose_full = pose_data["smplh:right_hand_pose"]  # [N, 15, 3]
+                translation_full = pose_data["smplh:translation"]  # [N, 3]
+                
+                # 初始化有效性标记
+                N = len(translation_full)
+                is_valid = np.ones(N, dtype=bool)
+                
+                # 如果存在smplh:is_valid键，使用该键的标记
+                if "smplh:is_valid" in pose_data:
+                    is_valid &= pose_data["smplh:is_valid"]
+                
+                # 必须对平移数据进行异常值检测
+                # 使用新的阈值检测方法，范围在-100到100之间
+                trans_is_valid = self.detect_translation_outliers_threshold(translation_full)
+                is_valid &= trans_is_valid
+                
+                # 对所有姿态参数进行平滑处理
+                global_orient_smoothed = self.smooth_outliers(global_orient_full, is_valid)
+                body_pose_smoothed = self.smooth_outliers(body_pose_full.reshape(-1, 63), is_valid).reshape(-1, 21, 3)
+                left_hand_pose_smoothed = self.smooth_outliers(left_hand_pose_full.reshape(-1, 45), is_valid).reshape(-1, 15, 3)
+                right_hand_pose_smoothed = self.smooth_outliers(right_hand_pose_full.reshape(-1, 45), is_valid).reshape(-1, 15, 3)
+                translation_smoothed = self.smooth_outliers(translation_full, is_valid)
+                
+                # 采样处理
+                global_orient = global_orient_smoothed[::stride]
+                body_pose = body_pose_smoothed[::stride].reshape(-1, 63)
+                left_hand_pose = left_hand_pose_smoothed[::stride].reshape(-1, 45)
+                right_hand_pose = right_hand_pose_smoothed[::stride].reshape(-1, 45)
+                translation = translation_smoothed[::stride]
                 # Seamless数据集没有betas字段，使用零向量
                 betas = np.zeros((1, 10), dtype=np.float32)                   # [1, 10]
 
@@ -480,6 +525,196 @@ class CustomDataset(Dataset):
                 tar_pose = torch.cat([tar_pose, trans_v], dim=1)
                 tar_pose = torch.cat([tar_pose, tar_face], dim=1)
             return tar_pose
+    
+    def detect_translation_outliers(self, translation, iqr_factor=1.0):
+        """
+        基于平移数据本身使用IQR方法检测异常值
+        
+        Args:
+            translation: 平移数据，形状为 (N, 3)
+            iqr_factor: IQR倍数，值越小检测越严格（默认1.0，标准值为1.5）
+            
+        Returns:
+            is_valid: 有效性标记，形状为 (N,)
+        """
+        N, _ = translation.shape
+        is_valid = np.ones(N, dtype=bool)
+        
+        # 对每个坐标轴分别检测异常值
+        for axis in range(3):
+            data = translation[:, axis]
+            
+            # 计算IQR
+            Q1 = np.percentile(data, 25)
+            Q3 = np.percentile(data, 75)
+            IQR = Q3 - Q1
+            
+            # 定义异常值阈值（更严格的检测，使用更小的IQR倍数）
+            lower_bound = Q1 - iqr_factor * IQR
+            upper_bound = Q3 + iqr_factor * IQR
+            
+            # 检测异常值
+            axis_is_valid = (data >= lower_bound) & (data <= upper_bound)
+            is_valid &= axis_is_valid
+        
+        return is_valid
+    
+    def detect_translation_outliers_threshold(self, translation, lower_bound=-100.0, upper_bound=100.0):
+        """
+        基于简单阈值检测平移数据中的异常值
+        
+        Args:
+            translation: 平移数据，形状为 (N, 3)
+            lower_bound: 正常值下限（默认-100.0）
+            upper_bound: 正常值上限（默认100.0）
+            
+        Returns:
+            is_valid: 有效性标记，形状为 (N,)
+        """
+        N, _ = translation.shape
+        is_valid = np.ones(N, dtype=bool)
+        
+        # 对每个坐标轴分别检测异常值
+        for axis in range(3):
+            data = translation[:, axis]
+            
+            # 检测异常值，必须在-100到100之间
+            axis_is_valid = (data >= lower_bound) & (data <= upper_bound)
+            is_valid &= axis_is_valid
+        
+        return is_valid
+    
+    # def smooth_outliers(self, data, is_valid):
+    #     """
+    #     对异常值区间进行平滑处理，使用区间两端的正常值进行插值
+        
+    #     Args:
+    #         data: 原始数据，形状为 (N, D)
+    #         is_valid: 有效性标记，形状为 (N,)
+            
+    #     Returns:
+    #         平滑后的数据，形状为 (N, D)
+    #     """
+    #     N, D = data.shape
+    #     smoothed_data = data.copy()
+        
+    #     # 找到所有异常帧的索引
+    #     invalid_indices = np.where(~is_valid)[0]
+        
+    #     if len(invalid_indices) == 0:
+    #         return smoothed_data
+        
+    #     # 将异常帧分组为连续区间
+    #     invalid_groups = []
+    #     current_group = [invalid_indices[0]]
+        
+    #     for i in range(1, len(invalid_indices)):
+    #         if invalid_indices[i] == current_group[-1] + 1:
+    #             current_group.append(invalid_indices[i])
+    #         else:
+    #             invalid_groups.append(current_group)
+    #             current_group = [invalid_indices[i]]
+    #     invalid_groups.append(current_group)
+        
+    #     # 对每个异常区间进行平滑处理
+    #     for group in invalid_groups:
+    #         start_idx = group[0]
+    #         end_idx = group[-1]
+            
+    #         # 找到区间前的最后一个正常帧和区间后的第一个正常帧
+    #         prev_valid = start_idx - 1 if start_idx > 0 else 0
+    #         next_valid = end_idx + 1 if end_idx < N - 1 else N - 1
+            
+    #         # 如果整个序列都是异常的，跳过
+    #         if prev_valid == next_valid:
+    #             continue
+            
+    #         # 获取前后正常帧的数据
+    #         prev_data = data[prev_valid]
+    #         next_data = data[next_valid]
+            
+    #         # 计算插值因子
+    #         group_length = end_idx - start_idx + 1
+    #         for i, idx in enumerate(group):
+    #             # 线性插值
+    #             alpha = (i + 1) / (group_length + 1)
+    #             smoothed_data[idx] = (1 - alpha) * prev_data + alpha * next_data
+        
+    #     return smoothed_data
+
+    def smooth_outliers(self, data, is_valid):
+        """
+        对异常值区间进行平滑处理，使用区间两端的正常值进行插值
+        
+        Args:
+            data: 原始数据，形状为 (N, D)
+            is_valid: 有效性标记，形状为 (N,)
+            
+        Returns:
+            平滑后的数据，形状为 (N, D)
+        """
+        N, D = data.shape
+        smoothed_data = data.copy()
+        
+        # 找到所有异常帧的索引
+        invalid_indices = np.where(~is_valid)[0]
+        
+        if len(invalid_indices) == 0:
+            return smoothed_data
+        
+        # 将异常帧分组为连续区间
+        invalid_groups = []
+        current_group = [invalid_indices[0]]
+        
+        for i in range(1, len(invalid_indices)):
+            if invalid_indices[i] == current_group[-1] + 1:
+                current_group.append(invalid_indices[i])
+            else:
+                invalid_groups.append(current_group)
+                current_group = [invalid_indices[i]]
+        invalid_groups.append(current_group)
+        
+        # 对每个异常区间进行平滑处理
+        for group in invalid_groups:
+            start_idx = group[0]
+            end_idx = group[-1]
+            
+            # 修正：准确查找前一个有效帧（从start_idx往前找第一个有效帧）
+            prev_valid = None
+            for idx in range(start_idx - 1, -1, -1):
+                if is_valid[idx]:
+                    prev_valid = idx
+                    break
+            
+            # 修正：准确查找后一个有效帧（从end_idx往后找第一个有效帧）
+            next_valid = None
+            for idx in range(end_idx + 1, N):
+                if is_valid[idx]:
+                    next_valid = idx
+                    break
+            
+            # 修正：严谨判断无有效插值基准（前后均无有效帧）
+            if prev_valid is None and next_valid is None:
+                # 无有效帧可供插值，跳过当前异常区间
+                continue
+            # 修正：单端有有效帧时，用该端数据填充（而非插值）
+            elif prev_valid is None:
+                # 只有后有效帧，用后有效帧数据填充异常区间
+                smoothed_data[start_idx:end_idx+1] = data[next_valid]
+            elif next_valid is None:
+                # 只有前有效帧，用前有效帧数据填充异常区间
+                smoothed_data[start_idx:end_idx+1] = data[prev_valid]
+            else:
+                # 前后均有有效帧，执行线性插值
+                prev_data = data[prev_valid]
+                next_data = data[next_valid]
+                
+                group_length = end_idx - start_idx + 1
+                for i, idx in enumerate(group):
+                    alpha = (i + 1) / (group_length + 1)
+                    smoothed_data[idx] = (1 - alpha) * prev_data + alpha * next_data
+        
+        return smoothed_data
 
 class MotionPreprocessor:
     def __init__(self, skeletons):

@@ -140,7 +140,7 @@ logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
 
 ##### ---- Dataloader ---- #####
-from dataloaders.final_sep import CustomDataset
+from dataloaders.mix_sep import CustomDataset
 from utils.config import parse_args
 
 dataset_args, _ = parse_args("configs/beat2_rvqvae.yaml")

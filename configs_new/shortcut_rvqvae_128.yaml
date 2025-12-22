@@ -7,7 +7,7 @@ wandb_log_dir: './outputs/wandb'
 output_dir: ./outputs/weights
 log_period: 10
 val_period: 20
-gpus: [0]
+gpus: [2]
 seed: 42
 ddp: false
 debug: false
