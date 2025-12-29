@@ -128,22 +128,22 @@ class CustomDataset(Dataset):
             self.build_cache(self.preloaded_dir)
         
         # In DDP mode, ensure all processes wait for cache building to complete
-        try:
-            if torch.distributed.is_initialized():
+        if build_cache and torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
                 torch.distributed.barrier()
-        except Exception as e:
-            logger.warning(f"Distributed barrier failed (likely not in DDP mode): {e}")
+            except Exception:
+                pass  # Silently ignore barrier failures - training can continue
         
         # Try to regenerate cache if corrupted (only on rank 0 to avoid race conditions)
         if self.rank == 0:
             self.regenerate_cache_if_corrupted()
         
         # Wait for cache regeneration to complete
-        try:
-            if torch.distributed.is_initialized():
+        if build_cache and torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
                 torch.distributed.barrier()
-        except Exception as e:
-            logger.warning(f"Distributed barrier failed (likely not in DDP mode): {e}")
+            except Exception:
+                pass  # Silently ignore barrier failures - training can continue
         
         self.load_db_mapping()
     

@@ -312,7 +312,8 @@ def filter_pose_outliers(pose_data, method='zscore', threshold=3.0, use_gpu=True
 def calculate_mean_std(data_dir, output_dir):
     """
     计算seamless_interaction数据集的姿态和平移数据的均值和标准差
-    根据用户要求，维度应该是52*6=312，其中52=1(global_orient)+21(body_pose)+15(left_hand)+15(right_hand)
+    根据用户要求，维度应该是55*6=330，其中55=1(global_orient)+21(body_pose)+15(left_hand)+15(right_hand)+3(fingers 22,23,24)
+    原始数据是52*6=312维，需要扩展到330维，缺少的关节数据是22、23和24，也就是从22*6到24*6的维度数据要补0处理
     """
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
@@ -357,6 +358,26 @@ def calculate_mean_std(data_dir, output_dir):
             left_hand_pose = data['smplh:left_hand_pose'] if 'smplh:left_hand_pose' in data else np.zeros((body_pose.shape[0], 15, 3), dtype=np.float32)
             right_hand_pose = data['smplh:right_hand_pose'] if 'smplh:right_hand_pose' in data else np.zeros((body_pose.shape[0], 15, 3), dtype=np.float32)
             
+            # 获取平移数据 (3维)
+            translation = data['smplh:translation']  # 形状: (frames, 3)
+            
+            # 初始化有效性标记
+            N = body_pose.shape[0]
+            is_valid = np.ones(N, dtype=bool)
+            
+            # 如果存在smplh:is_valid键，使用该键的标记进行过滤
+            if "smplh:is_valid" in data:
+                is_valid &= data["smplh:is_valid"]
+            
+            # 根据is_valid过滤数据
+            if not np.all(is_valid):
+                body_pose = body_pose[is_valid]
+                global_orient = global_orient[is_valid]
+                left_hand_pose = left_hand_pose[is_valid]
+                right_hand_pose = right_hand_pose[is_valid]
+                translation = translation[is_valid]
+                N = body_pose.shape[0]
+            
             # 将3D轴角表示正确转换为6D旋转表示
             # 1. 首先将numpy数组转换为PyTorch张量
             # 2. 使用axis_angle_to_matrix将3D轴角转换为旋转矩阵
@@ -384,15 +405,29 @@ def calculate_mean_std(data_dir, output_dir):
             right_hand_matrix = axis_angle_to_matrix(right_hand_tensor)  # (frames, 15, 3, 3)
             right_hand_6d = matrix_to_rotation_6d(right_hand_matrix).reshape(right_hand_pose.shape[0], -1).cpu().numpy()  # (frames, 15*6=90)
             
-            # 组合所有6维表示的姿态数据
+            # 组合所有6维表示的姿态数据（原始312维）
             # 总维度：1*6 + 21*6 + 15*6 + 15*6 = 6 + 126 + 90 + 90 = 312
             combined_pose_312 = np.concatenate([global_6d, body_6d, left_hand_6d, right_hand_6d], axis=1)
             
-            # 获取平移数据 (3维)
-            translation = data['smplh:translation']  # 形状: (frames, 3)
+            # 扩展到330维，在关节22、23、24的位置补0
+            # 关节22、23、24对应的是手指关节，每个关节6维，共18维
+            # 在body_pose之后、left_hand_pose之前插入这18维的0值
+            # 312维的结构：global_orient(6) + body_pose(126) + left_hand_pose(90) + right_hand_pose(90)
+            # 330维的结构：global_orient(6) + body_pose(126) + fingers_22_23_24(18) + left_hand_pose(90) + right_hand_pose(90)
+            
+            # 创建18维的零值数据
+            fingers_zero = np.zeros((N, 18), dtype=np.float32)
+            
+            # 在body_pose之后、left_hand_pose之前插入18维零值
+            # body_pose结束位置：6 + 126 = 132
+            combined_pose_330 = np.concatenate([
+                combined_pose_312[:, :132],  # global_orient + body_pose
+                fingers_zero,               # 关节22、23、24的零值
+                combined_pose_312[:, 132:]   # left_hand_pose + right_hand_pose
+            ], axis=1)
             
             # 添加到集合中
-            all_pose_data.append(combined_pose_312)
+            all_pose_data.append(combined_pose_330)
             all_trans_data.append(translation)
             
         except Exception as e:
@@ -617,8 +652,8 @@ def calculate_mean_std(data_dir, output_dir):
     print(f"平移标准差形状: {trans_std.shape}")
     
     # 保存为npy文件
-    np.save(os.path.join(output_dir, 'seamless_2_312_mean.npy'), pose_mean.astype(np.float32))
-    np.save(os.path.join(output_dir, 'seamless_2_312_std.npy'), pose_std.astype(np.float32))
+    np.save(os.path.join(output_dir, 'seamless_2_330_mean.npy'), pose_mean.astype(np.float32))
+    np.save(os.path.join(output_dir, 'seamless_2_330_std.npy'), pose_std.astype(np.float32))
     np.save(os.path.join(output_dir, 'seamless_2_trans_mean.npy'), trans_mean)
     np.save(os.path.join(output_dir, 'seamless_2_trans_std.npy'), trans_std)
     
@@ -641,7 +676,7 @@ def calculate_mean_std(data_dir, output_dir):
         print(f"平移数据标准差: {trans_std}")
     
     print(f"已保存均值和标准差文件到 {output_dir}")
-    print(f"姿态数据维度: 312 (52个关节 × 6维)")
+    print(f"姿态数据维度: 330 (55个关节 × 6维)")
     print(f"平移数据维度: 3")
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ class BaseTrainer(object):
     def __init__(self, cfg, args):
         self.cfg = cfg
         self.args = args
-        self.rank = 0
+        self.rank = getattr(cfg, 'rank', 0)
         self.checkpoint_path = os.path.join(cfg.output_dir, cfg.exp_name)
         
 
@@ -51,24 +51,29 @@ class BaseTrainer(object):
         }
               
         self.train_data = init_class(cfg.data.name_pyfile, cfg.data.class_name, cfg.data, loader_type='train')
-        if cfg.ddp:
-            self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.train_data)
-            self.train_loader = DataLoader(self.train_data, batch_size=cfg.data.train_bs, sampler=self.train_sampler, drop_last=True, num_workers=4)
+        
+        if self.cfg.ddp:
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            self.train_sampler = torch.utils.data.distributed.DistributedSampler(
+                self.train_data, 
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True
+            )
         else:
-            self.train_loader = DataLoader(self.train_data, batch_size=cfg.data.train_bs, drop_last=True, num_workers=4)
+            self.train_sampler = None
+        self.train_loader = DataLoader(self.train_data, batch_size=cfg.data.train_bs, sampler=self.train_sampler, drop_last=True, num_workers=0)
         
         if cfg.data.test_clip:
             # test data for test_clip, only used for test_clip_fgd
             self.test_clip_data = init_class(cfg.data.name_pyfile, cfg.data.class_name, cfg.data, loader_type='test')
-            self.test_clip_loader = DataLoader(self.test_clip_data, batch_size=64, drop_last=False)
+            self.test_clip_loader = DataLoader(self.test_clip_data, batch_size=64, drop_last=False) #64
         
         # test data for fgd, l1div and bc
         test_data_cfg = cfg.data.copy()
         test_data_cfg.test_clip = False
         self.test_data = init_class(cfg.data.name_pyfile, cfg.data.class_name, test_data_cfg, loader_type='test')
-        # Use val_bs if available, otherwise default to 1
-        val_batch_size = cfg.data.get('val_bs', 1)
-        # For test data, we need to use batch_size=1 because audio lengths vary
         self.test_loader = DataLoader(self.test_data, batch_size=1, drop_last=False)
         
         
@@ -101,16 +106,17 @@ class BaseTrainer(object):
         eval_args.data_path_1 = "./datasets/hub/"
         eval_args.vae_grow = [1,1,2,1]
         
-        # Use the first GPU in gpus list for eval_copy model
-        eval_copy = getattr(eval_model_module, 'VAESKConv')(eval_args).to(self.cfg.gpus[0])
+        eval_copy = getattr(eval_model_module, 'VAESKConv')(eval_args).to(self.rank)
+        logger.info(f"VAESKConv model created on GPU {self.rank}, loading checkpoints...")
         other_tools.load_checkpoints(
             eval_copy, 
             './datasets/BEAT_SMPL/beat_v2.0.0/beat_english_v2.0.0/weights/AESKConv_240_100.bin', 
             'VAESKConv'
         )
         self.eval_copy = eval_copy
+        logger.info(f"VAESKConv checkpoints loaded successfully on GPU {self.rank}")
         
-        
+        logger.info(f"Creating SMPLX model on GPU {self.rank}...")
         self.smplx = smplx.create(
             self.cfg.data.data_path_1+"smplx_models/", 
             model_type='smplx',
@@ -120,11 +126,18 @@ class BaseTrainer(object):
             num_expression_coeffs=100, 
             ext='npz',
             use_pca=False,
-        ).to(self.cfg.gpus[0]).eval()
+        )
+        logger.info(f"SMPLX model created, moving to GPU {self.rank}...")
+        self.smplx = self.smplx.to(self.rank)
+        logger.info(f"SMPLX model moved to GPU {self.rank}, setting to eval mode...")
+        self.smplx = self.smplx.eval()
+        logger.info(f"SMPLX model initialized successfully on GPU {self.rank}")
         
+        logger.info(f"Creating alignmenter and l1_calculator on GPU {self.rank}...")
         self.alignmenter = metric.alignment(0.3, 7, self.train_data.avg_vel, upper_body=[3,6,9,12,13,14,15,16,17,18,19,20,21]) if self.rank == 0 else None
         self.align_mask = 60
         self.l1_calculator = metric.L1div() if self.rank == 0 else None
+        logger.info(f"Alignmenter and l1_calculator created successfully on GPU {self.rank}")
 
     def train_recording(self, epoch, its, t_data, t_train, mem_cost, lr_g, lr_d=None):
         """Enhanced training metrics logging"""
@@ -147,8 +160,9 @@ class BaseTrainer(object):
         })
         
 
-        # Log all metrics at once if using wandb
-        wandb.log(metrics, step=epoch*self.train_length+its)
+        # Log all metrics at once if using wandb (only on rank 0)
+        if self.rank == 0:
+            wandb.log(metrics, step=epoch*self.train_length+its)
 
         # Print progress
         pstr = f"[{epoch:03d}][{its:03d}/{self.train_length:03d}]  "

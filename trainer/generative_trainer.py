@@ -105,11 +105,20 @@ class CustomTrainer(BaseTrainer):
         )
 
         if self.cfg.ddp:
+            logger.info(f"Creating model {cfg.model.g_name} on GPU {self.rank}...")
             self.model = getattr(model_module, cfg.model.g_name)(cfg).to(self.rank)
+            logger.info(f"Model created on GPU {self.rank}, synchronizing all processes...")
+            torch.distributed.barrier()
+            logger.info(f"All processes synchronized after model creation on GPU {self.rank}")
+            logger.info(f"Creating process group on GPU {self.rank}...")
             process_group = torch.distributed.new_group()
+            logger.info(f"Process group created on GPU {self.rank}, converting to SyncBatchNorm...")
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(
                 self.model, process_group
             )
+            logger.info(f"SyncBatchNorm converted on GPU {self.rank}, synchronizing before DDP...")
+            torch.distributed.barrier()
+            logger.info(f"All processes synchronized, wrapping with DDP on GPU {self.rank}...")
             self.model = DDP(
                 self.model,
                 device_ids=[self.rank],
@@ -117,10 +126,15 @@ class CustomTrainer(BaseTrainer):
                 broadcast_buffers=False,
                 find_unused_parameters=False,
             )
+            logger.info(f"DDP wrapper created on GPU {self.rank}, final synchronization...")
+            torch.distributed.barrier()
+            logger.info(f"All processes synchronized after DDP wrapper on GPU {self.rank}")
         else:
-            # Create model and move to first GPU in gpus list
-            model = getattr(model_module, cfg.model.g_name)(cfg).to(self.cfg.gpus[0])
-            self.model = torch.nn.DataParallel(model, self.cfg.gpus)
+            logger.info(f"Creating model with DataParallel on GPU {self.rank}...")
+            self.model = torch.nn.DataParallel(
+                getattr(model_module, cfg.model.g_name)(cfg), self.cfg.gpus
+            ).cuda()
+            logger.info(f"DataParallel model created on GPU {self.rank}")
 
         if self.args.mode == "train":
             if self.rank == 0:
@@ -137,34 +151,38 @@ class CustomTrainer(BaseTrainer):
         # Body part VQ models
         self.vq_models = self._create_body_vq_models()
 
-        # Set all VQ models to eval mode and move to the first GPU in gpus list
+        # Set all VQ models to eval mode and move to the corresponding GPU
         for model in self.vq_models.values():
-            model.eval().to(self.cfg.gpus[0])
+            model.eval().to(self.rank)
 
         self.vq_model_upper, self.vq_model_hands, self.vq_model_lower = (
             self.vq_models.values()
         )
 
         ##### Loss functions #####
-        self.reclatent_loss = nn.MSELoss().to(self.cfg.gpus[0])
-        self.vel_loss = torch.nn.L1Loss(reduction="mean").to(self.cfg.gpus[0])
+        self.reclatent_loss = nn.MSELoss().to(self.rank)
+        self.vel_loss = torch.nn.L1Loss(reduction="mean").to(self.rank)
 
         ##### Normalization #####
-        self.mean = np.load("./mean_std/beatx_2_330_mean.npy")
-        self.std = np.load("./mean_std/beatx_2_330_std.npy")
+        mean_pose_path = getattr(cfg, 'mean_pose_path', './mean_std/beatx_2_330_mean.npy')
+        std_pose_path = getattr(cfg, 'std_pose_path', './mean_std/beatx_2_330_std.npy')
+        self.mean = np.load(mean_pose_path)
+        self.std = np.load(std_pose_path)
 
         # Extract body part specific normalizations
         for part in ["upper", "hands", "lower"]:
             mask = globals()[f"{part}_body_mask"]
-            setattr(self, f"mean_{part}", torch.from_numpy(self.mean[mask]).to(self.cfg.gpus[0]))
-            setattr(self, f"std_{part}", torch.from_numpy(self.std[mask]).to(self.cfg.gpus[0]))
+            setattr(self, f"mean_{part}", torch.from_numpy(self.mean[mask]).to(self.rank))
+            setattr(self, f"std_{part}", torch.from_numpy(self.std[mask]).to(self.rank))
 
+        mean_trans_path = getattr(cfg, 'mean_trans_path', './mean_std/beatx_2_trans_mean.npy')
+        std_trans_path = getattr(cfg, 'std_trans_path', './mean_std/beatx_2_trans_std.npy')
         self.trans_mean = torch.from_numpy(
-            np.load("./mean_std/beatx_2_trans_mean.npy")
-        ).to(self.cfg.gpus[0])
+            np.load(mean_trans_path)
+        ).to(self.rank)
         self.trans_std = torch.from_numpy(
-            np.load("./mean_std/beatx_2_trans_std.npy")
-        ).to(self.cfg.gpus[0])
+            np.load(std_trans_path)
+        ).to(self.rank)
 
         if self.args.checkpoint:
             try:
@@ -237,23 +255,23 @@ class CustomTrainer(BaseTrainer):
         return original_shape_t
 
     def inverse_selection_tensor(self, filtered_t, selection_array, n):
-        selection_array = torch.from_numpy(selection_array).to(self.cfg.gpus[0])
-        original_shape_t = torch.zeros((n, 165)).to(self.cfg.gpus[0])
+        selection_array = torch.from_numpy(selection_array).to(self.rank)
+        original_shape_t = torch.zeros((n, 165)).to(self.rank)
         selected_indices = torch.where(selection_array == 1)[0]
         for i in range(n):
             original_shape_t[i, selected_indices] = filtered_t[i]
         return original_shape_t
 
     def _load_data(self, dict_data):
-        facial_rep = dict_data["facial"].to(self.cfg.gpus[0])
-        beta = dict_data["beta"].to(self.cfg.gpus[0])
-        tar_trans = dict_data["trans"].to(self.cfg.gpus[0])
-        tar_id = dict_data["id"].to(self.cfg.gpus[0])
+        facial_rep = dict_data["facial"].to(self.rank)
+        beta = dict_data["beta"].to(self.rank)
+        tar_trans = dict_data["trans"].to(self.rank)
+        tar_id = dict_data["id"].to(self.rank)
 
         # process the pose data
-        tar_pose = dict_data["pose"][:, :, :165].to(self.cfg.gpus[0])
-        tar_trans_v = dict_data["trans_v"].to(self.cfg.gpus[0])
-        tar_trans = dict_data["trans"].to(self.cfg.gpus[0])
+        tar_pose = dict_data["pose"][:, :, :165].to(self.rank)
+        tar_trans_v = dict_data["trans_v"].to(self.rank)
+        tar_trans = dict_data["trans"].to(self.rank)
         bs, n, j = tar_pose.shape[0], tar_pose.shape[1], self.joints
         tar_pose_hands = tar_pose[:, :, 25 * 3 : 55 * 3]
         tar_pose_hands = rc.axis_angle_to_matrix(tar_pose_hands.reshape(bs, n, 30, 3))
@@ -289,14 +307,14 @@ class CustomTrainer(BaseTrainer):
 
         word = dict_data.get("word", None)
         if word is not None:
-            word = word.to(self.cfg.gpus[0])
+            word = word.to(self.rank)
 
         # style feature is always None (without annotation, we never know what it is)
         style_feature = None
 
         audio_onset = None
         if self.cfg.data.onset_rep:
-            audio_onset = dict_data["audio_onset"].to(self.cfg.gpus[0])
+            audio_onset = dict_data["audio_onset"].to(self.rank)
         
         # Get audio name if available
         audio_name = dict_data.get("audio_name", None)
@@ -419,7 +437,7 @@ class CustomTrainer(BaseTrainer):
             cond_["y"]["word"] = in_word_tmp
             cond_["y"]["id"] = in_id_tmp
             cond_["y"]["seed"] = in_seed_tmp
-            cond_["y"]["style_feature"] = torch.zeros([bs, 512]).to(self.cfg.gpus[0])
+            cond_["y"]["style_feature"] = torch.zeros([bs, 512]).to(self.rank)
 
             sample = self.model(cond_)["latents"]
 
@@ -636,20 +654,25 @@ class CustomTrainer(BaseTrainer):
                 # Calculate latent representations for evaluation
                 if hasattr(self, "eval_copy") and mode != "test_render":
                     remain = n % self.cfg.vae_test_len
-                    latent_out.append(
-                        self.eval_copy.map2latent(rec_pose[:, : n - remain])
-                        .reshape(-1, self.cfg.vae_length)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
-                    latent_ori.append(
-                        self.eval_copy.map2latent(tar_pose[:, : n - remain])
-                        .reshape(-1, self.cfg.vae_length)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
+                    
+                    if n - remain > 0:
+                        latent_rec = self.eval_copy.map2latent(rec_pose[:, : n - remain])
+                        latent_tar = self.eval_copy.map2latent(tar_pose[:, : n - remain])
+                        
+                        latent_out.append(
+                            latent_rec
+                            .reshape(-1, self.cfg.vae_length)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
+                        latent_ori.append(
+                            latent_tar
+                            .reshape(-1, self.cfg.vae_length)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
 
                 rec_pose = rc.rotation_6d_to_matrix(rec_pose.reshape(bs * n, j, 6))
                 rec_pose = rc.matrix_to_axis_angle(rec_pose).reshape(bs * n, j * 3)
@@ -658,15 +681,15 @@ class CustomTrainer(BaseTrainer):
 
                 # Generate SMPLX vertices and joints
                 # Process in smaller chunks to reduce memory usage
-                chunk_size = 32  # Adjust based on available memory
+                chunk_size = 1024  # Adjust based on available memory
                 joints_rec_list = []
                 
                 for i in range(0, bs * n, chunk_size):
                     end_idx = min(i + chunk_size, bs * n)
                     vertices_rec = self.smplx(
                         betas=tar_beta.reshape(bs * n, 300)[i:end_idx],
-                        transl=rec_trans.reshape(bs * n, 3)[i:end_idx] - rec_trans.reshape(bs * n, 3)[i:end_idx],
-                        expression=tar_exps.reshape(bs * n, 100)[i:end_idx] - tar_exps.reshape(bs * n, 100)[i:end_idx],
+                        transl=rec_trans.reshape(bs * n, 3)[i:end_idx],
+                        expression=tar_exps.reshape(bs * n, 100)[i:end_idx],
                         jaw_pose=rec_pose[:, 66:69][i:end_idx],
                         global_orient=rec_pose[:, :3][i:end_idx],
                         body_pose=rec_pose[:, 3 : 21 * 3 + 3][i:end_idx],
@@ -685,7 +708,7 @@ class CustomTrainer(BaseTrainer):
                 joints_rec = joints_rec.reshape(bs, n, 127 * 3)[0, :n, : 55 * 3]
 
                 # Calculate L1 diversity
-                if hasattr(self, "l1_calculator"):
+                if self.l1_calculator is not None:
                     _ = self.l1_calculator.run(joints_rec)
 
                 # Calculate alignment for single batch
@@ -722,45 +745,52 @@ class CustomTrainer(BaseTrainer):
                         onset_bt, beat_vel, 30
                     ) * (n - 2 * self.align_mask)
 
-                # Mode-specific processing
-                if mode == "test" and save_results:
-                    # Calculate facial losses for test mode
-                    vertices_rec_face = self.smplx(
-                        betas=tar_beta.reshape(bs * n, 300),
-                        transl=rec_trans.reshape(bs * n, 3)
-                        - rec_trans.reshape(bs * n, 3),
-                        expression=rec_exps.reshape(bs * n, 100),
-                        jaw_pose=rec_pose[:, 66:69],
-                        global_orient=rec_pose[:, :3] - rec_pose[:, :3],
-                        body_pose=rec_pose[:, 3 : 21 * 3 + 3]
-                        - rec_pose[:, 3 : 21 * 3 + 3],
-                        left_hand_pose=rec_pose[:, 25 * 3 : 40 * 3]
-                        - rec_pose[:, 25 * 3 : 40 * 3],
-                        right_hand_pose=rec_pose[:, 40 * 3 : 55 * 3]
-                        - rec_pose[:, 40 * 3 : 55 * 3],
-                        return_verts=True,
-                        return_joints=True,
-                        leye_pose=rec_pose[:, 69:72] - rec_pose[:, 69:72],
-                        reye_pose=rec_pose[:, 72:75] - rec_pose[:, 72:75],
-                    )
-                    vertices_tar_face = self.smplx(
-                        betas=tar_beta.reshape(bs * n, 300),
-                        transl=tar_trans.reshape(bs * n, 3)
-                        - tar_trans.reshape(bs * n, 3),
-                        expression=tar_exps.reshape(bs * n, 100),
-                        jaw_pose=tar_pose[:, 66:69],
-                        global_orient=tar_pose[:, :3] - tar_pose[:, :3],
-                        body_pose=tar_pose[:, 3 : 21 * 3 + 3]
-                        - tar_pose[:, 3 : 21 * 3 + 3],
-                        left_hand_pose=tar_pose[:, 25 * 3 : 40 * 3]
-                        - tar_pose[:, 25 * 3 : 40 * 3],
-                        right_hand_pose=tar_pose[:, 40 * 3 : 55 * 3]
-                        - tar_pose[:, 40 * 3 : 55 * 3],
-                        return_verts=True,
-                        return_joints=True,
-                        leye_pose=tar_pose[:, 69:72] - tar_pose[:, 69:72],
-                        reye_pose=tar_pose[:, 72:75] - tar_pose[:, 72:75],
-                    )
+                # Calculate face vertices for loss computation
+                if mode == "test":
+                    chunk_size = 1024
+                    vertices_rec_face_list = []
+                    vertices_tar_face_list = []
+                    
+                    for i in range(0, bs * n, chunk_size):
+                        end_idx = min(i + chunk_size, bs * n)
+                        
+                        vertices_rec_face = self.smplx(
+                            betas=tar_beta.reshape(bs * n, 300)[i:end_idx],
+                            transl=rec_trans.reshape(bs * n, 3)[i:end_idx],
+                            expression=rec_exps.reshape(bs * n, 100)[i:end_idx],
+                            jaw_pose=rec_pose[:, 66:69].reshape(bs * n, 3)[i:end_idx],
+                            global_orient=rec_pose[:, :3].reshape(bs * n, 3)[i:end_idx],
+                            body_pose=rec_pose[:, 3 : 21 * 3 + 3].reshape(bs * n, 63)[i:end_idx],
+                            left_hand_pose=rec_pose[:, 25 * 3 : 40 * 3].reshape(bs * n, 45)[i:end_idx],
+                            right_hand_pose=rec_pose[:, 40 * 3 : 55 * 3].reshape(bs * n, 45)[i:end_idx],
+                            return_verts=True,
+                            return_joints=True,
+                            leye_pose=rec_pose[:, 69:72].reshape(bs * n, 3)[i:end_idx],
+                            reye_pose=rec_pose[:, 72:75].reshape(bs * n, 3)[i:end_idx],
+                        )
+                        
+                        vertices_tar_face = self.smplx(
+                            betas=tar_beta.reshape(bs * n, 300)[i:end_idx],
+                            transl=tar_trans.reshape(bs * n, 3)[i:end_idx],
+                            expression=tar_exps.reshape(bs * n, 100)[i:end_idx],
+                            jaw_pose=tar_pose[:, 66:69].reshape(bs * n, 3)[i:end_idx],
+                            global_orient=tar_pose[:, :3].reshape(bs * n, 3)[i:end_idx],
+                            body_pose=tar_pose[:, 3 : 21 * 3 + 3].reshape(bs * n, 63)[i:end_idx],
+                            left_hand_pose=tar_pose[:, 25 * 3 : 40 * 3].reshape(bs * n, 45)[i:end_idx],
+                            right_hand_pose=tar_pose[:, 40 * 3 : 55 * 3].reshape(bs * n, 45)[i:end_idx],
+                            return_verts=True,
+                            return_joints=True,
+                            leye_pose=tar_pose[:, 69:72].reshape(bs * n, 3)[i:end_idx],
+                            reye_pose=tar_pose[:, 72:75].reshape(bs * n, 3)[i:end_idx],
+                        )
+                        
+                        vertices_rec_face_list.append(vertices_rec_face["vertices"].detach().cpu())
+                        vertices_tar_face_list.append(vertices_tar_face["vertices"].detach().cpu())
+                        del vertices_rec_face, vertices_tar_face
+                        torch.cuda.empty_cache()
+                    
+                    vertices_rec_face = {"vertices": torch.cat(vertices_rec_face_list, dim=0)}
+                    vertices_tar_face = {"vertices": torch.cat(vertices_tar_face_list, dim=0)}
 
                     facial_rec = (
                         vertices_rec_face["vertices"].reshape(1, n, -1)[0, :n].cpu()
@@ -800,7 +830,6 @@ class CustomTrainer(BaseTrainer):
                             file_id = test_seq_list.iloc[its]["id"]
                         else:
                             # Extract filename from audio path
-                            import os
                             file_id = os.path.basename(loaded_data["audio_name"][0]).split(".")[0]
                         
                         # Try to load gt_npz from the default path, fallback to demo example if not found
@@ -924,7 +953,7 @@ class CustomTrainer(BaseTrainer):
         logger.info(f"align score: {align_avg}")
         self.tracker.update_meter("bc", "val", align_avg)
 
-        l1div = self.l1_calculator.avg()
+        l1div = self.l1_calculator.avg() if self.l1_calculator is not None else 0.0
         logger.info(f"l1div score: {l1div}")
         self.tracker.update_meter("l1div", "val", l1div)
 
@@ -940,7 +969,7 @@ class CustomTrainer(BaseTrainer):
 
         # Test on CLIP dataset
         results_clip = self._common_test_inference(
-            self.test_clip_loader, epoch, mode="test_clip"
+            self.test_clip_loader, epoch, mode="test_clip", max_iterations=10
         )
 
         total_length_clip = results_clip["total_length"]
@@ -965,7 +994,7 @@ class CustomTrainer(BaseTrainer):
 
         # Test on regular test dataset for recording
         results_test = self._common_test_inference(
-            self.test_loader, epoch, mode="test_clip"
+            self.test_loader, epoch, mode="test_clip", max_iterations=10
         )
 
         total_length = results_test["total_length"]
@@ -984,7 +1013,7 @@ class CustomTrainer(BaseTrainer):
         logger.info(f"align score: {align_avg}")
         self.tracker.update_meter("bc", "val", align_avg)
 
-        l1div = self.l1_calculator.avg()
+        l1div = self.l1_calculator.avg() if self.l1_calculator is not None else 0.0
         logger.info(f"l1div score: {l1div}")
         self.tracker.update_meter("l1div", "val", l1div)
 
@@ -1000,7 +1029,7 @@ class CustomTrainer(BaseTrainer):
         os.makedirs(results_save_path, exist_ok=True)
 
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="test", save_results=True
+            self.test_loader, epoch, mode="test", max_iterations=10, save_results=False #True
         )
 
         total_length = results["total_length"]
@@ -1024,7 +1053,7 @@ class CustomTrainer(BaseTrainer):
         logger.info(f"align score: {align_avg}")
         self.test_recording("bc", align_avg, epoch)
 
-        l1div = self.l1_calculator.avg()
+        l1div = self.l1_calculator.avg() if self.l1_calculator is not None else 0.0
         logger.info(f"l1div score: {l1div}")
         self.test_recording("l1div", l1div, epoch)
 
@@ -1045,7 +1074,7 @@ class CustomTrainer(BaseTrainer):
         save video
         """
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="test_render", save_results=True
+            self.test_loader, epoch, mode="test_render", max_iterations=10, save_results=False #True
         )
 
     def load_checkpoint(self, checkpoint):

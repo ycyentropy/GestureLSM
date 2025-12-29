@@ -15,9 +15,9 @@ import smplx
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='Calculate mean velocity for seamless_interaction dataset')
-    parser.add_argument('--input_dir', type=str, required=True,
+    parser.add_argument('--input_dir', type=str, default='/home/embodied/yangchenyu/GestureLSM/datasets/seamless_interaction',
                         help='Input dataset directory')
-    parser.add_argument('--output_dir', type=str, required=True,
+    parser.add_argument('--output_dir', type=str, default='/home/embodied/yangchenyu/GestureLSM/mean_std_seamless',
                         help='Output directory for results')
     parser.add_argument('--smplx_model_path', type=str, 
                         default='/home/embodied/yangchenyu/GestureLSM/datasets/hub/smplx_models/',
@@ -52,6 +52,35 @@ def find_npz_files(directory):
                 npz_files.append(os.path.join(root, file))
     return npz_files
 
+def detect_translation_outliers_threshold(translation, lower_bound=-100.0, upper_bound=100.0):
+    """
+    基于简单阈值检测平移数据中的异常值
+    
+    Args:
+        translation: 平移数据，形状为 (N, 3) 或可能的其他形状
+        lower_bound: 正常值下限（默认-100.0）
+        upper_bound: 正常值上限（默认100.0）
+        
+    Returns:
+        is_valid: 有效性标记，形状为 (N,)
+    """
+    # 确保translation是2维数据
+    if len(translation.shape) > 2:
+        translation = translation.reshape(-1, translation.shape[-1])
+    
+    N, _ = translation.shape
+    is_valid = np.ones(N, dtype=bool)
+    
+    # 对每个坐标轴分别检测异常值
+    for axis in range(3):
+        data = translation[:, axis]
+        
+        # 检测异常值，必须在-100到100之间
+        axis_is_valid = (data >= lower_bound) & (data <= upper_bound)
+        is_valid &= axis_is_valid
+    
+    return is_valid
+
 def process_npz_file(file_path, smplx_model, batch_size, device):
     """处理单个 npz 文件，生成关节点数据"""
     # 加载数据
@@ -64,6 +93,10 @@ def process_npz_file(file_path, smplx_model, batch_size, device):
     right_hand_pose = data['smplh:right_hand_pose']
     translation = data['smplh:translation']
     is_valid = data['smplh:is_valid']
+    
+    # 检测平移数据异常值
+    trans_is_valid = detect_translation_outliers_threshold(translation)
+    is_valid &= trans_is_valid
     
     # 使用 is_valid 过滤数据
     valid_indices = np.where(is_valid)[0]
@@ -120,6 +153,10 @@ def process_npz_file(file_path, smplx_model, batch_size, device):
     for start_idx in range(0, seq_length, batch_size):
         end_idx = min(start_idx + batch_size, seq_length)
         
+        # 跳过空批次
+        if start_idx >= end_idx:
+            continue
+        
         with torch.no_grad():
             # 使用 smplx 模型生成关节点
             outputs = smplx_model(
@@ -146,6 +183,8 @@ def process_npz_file(file_path, smplx_model, batch_size, device):
             torch.cuda.empty_cache()
     
     # 合并所有批次的关节点并保持在CPU上
+    if not all_joints:
+        return None
     joints = torch.cat(all_joints, dim=0)
     
     return joints
@@ -156,6 +195,10 @@ def calculate_velocity(joints, fps=30, device='cuda:0'):
     
     # 将关节点数据临时转移到GPU上进行快速计算
     joints_gpu = joints.to(device)
+    
+    # 关键修复：将厘米单位转换为米单位
+    # seamless_interaction数据集使用厘米单位，而SMPL模型使用米单位
+    # joints_gpu = joints_gpu / 100.0
     
     # 转换为 (55, n_frames, 3) 格式，便于计算
     joints_gpu = joints_gpu.permute(1, 0, 2)

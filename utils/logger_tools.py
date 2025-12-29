@@ -27,17 +27,17 @@ def setup_logger(save_dir, distributed_rank=0, filename="log.txt", mode="a"):
     save_file = os.path.join(save_dir, filename)
     if mode == "o" and os.path.exists(save_file):
         os.remove(save_file)
-    # only keep logger in rank0 process
+    # output to stderr for all ranks, but only rank 0 writes to file
+    logger.add(
+        sys.stderr,
+        format=loguru_format,
+        level="INFO",
+        enqueue=True,
+    )
     if distributed_rank == 0:
-        logger.add(
-            sys.stderr,
-            format=loguru_format,
-            level="INFO",
-            enqueue=True,
-        )
         logger.add(save_file,
-            format=loguru_format,       
-                  )
+            format=loguru_format,
+            )
 
 
 def set_args_and_logger(args, rank):

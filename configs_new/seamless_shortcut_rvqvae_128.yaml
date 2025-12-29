@@ -6,10 +6,10 @@ wandb_key: "xxxxxxx"
 wandb_log_dir: './outputs/wandb'
 output_dir: ./outputs/weights
 log_period: 10
-val_period: 20
-gpus: [0]
+val_period: 50 #20
+gpus: [4,5,6,7]
 seed: 42
-ddp: false
+ddp: true
 debug: false
 
 vqvae_upper_path: ./outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_upper/net_best.pth
@@ -27,8 +27,10 @@ vqvae_squeeze_scale: 4
 vqvae_latent_scale: 5
 vae_length: 240
 vae_test_len: 32
-mean_pose_path: "./mean_std_seamless/seamless_2_312_mean.npy"
-std_pose_path: "./mean_std_seamless/seamless_2_312_std.npy"
+mean_pose_path: "./mean_std_seamless/seamless_2_330_mean.npy"
+std_pose_path: "./mean_std_seamless/seamless_2_330_std.npy"
+mean_trans_path: "./mean_std_seamless/seamless_2_trans_mean.npy"
+std_trans_path: "./mean_std_seamless/seamless_2_trans_std.npy"
 
 data:
   name_pyfile: "dataloaders.seamless_interaction_dataset"
@@ -117,7 +119,7 @@ validation:
 
 solver:
   opt: 'adam'
-  epochs: 1000
+  epochs: 100 #1000
   grad_norm: 1.0
   momentum: 0.8
   nesterov: True

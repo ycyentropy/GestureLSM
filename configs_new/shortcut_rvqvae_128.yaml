@@ -7,9 +7,9 @@ wandb_log_dir: './outputs/wandb'
 output_dir: ./outputs/weights
 log_period: 10
 val_period: 20
-gpus: [2]
+gpus: [4,5,6,7]
 seed: 42
-ddp: false
+ddp: true
 debug: false
 
 vqvae_upper_path: ./ckpt/net_300000_upper.pth
@@ -27,8 +27,10 @@ vqvae_squeeze_scale: 4
 vqvae_latent_scale: 5
 vae_length: 240
 vae_test_len: 32
-mean_pose_path: "./mean_std/rep15d_mean.npy"
-std_pose_path: "./mean_std/rep15d_std.npy"
+mean_pose_path: "./mean_std/beatx_2_330_mean.npy"
+std_pose_path: "./mean_std/beatx_2_330_std.npy"
+mean_trans_path: "./mean_std/beatx_2_trans_mean.npy"
+std_trans_path: "./mean_std/beatx_2_trans_std.npy"
 
 data:
   name_pyfile: "dataloaders.beat_sep_lower"

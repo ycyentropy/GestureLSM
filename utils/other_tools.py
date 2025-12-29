@@ -775,7 +775,9 @@ def save_checkpoints(save_path, model, opt=None, epoch=None, lrs=None):
     torch.save(states, save_path)
 
 def load_checkpoints(model, save_path, load_name='model'):
+    logger.info(f"Loading checkpoint from {save_path} for {load_name}...")
     states = torch.load(save_path)
+    logger.info(f"Checkpoint loaded, processing model_state (keys: {len(states['model_state'])})...")
     new_weights = OrderedDict()
     flag=False
     for k, v in states['model_state'].items():
@@ -785,22 +787,32 @@ def load_checkpoints(model, save_path, load_name='model'):
         else:
             new_weights[k[7:]]=v
             flag=True
+    logger.info(f"Processed model_state, flag={flag}, new_weights keys: {len(new_weights)}")
     if flag: 
         try:
+            logger.info(f"Attempting to load state_dict with new_weights (strict=True)...")
             model.load_state_dict(new_weights)
+            logger.info(f"Successfully loaded with new_weights (strict=True)")
         except:
             try:
+                logger.info(f"Attempting to load state_dict with original model_state (strict=True)...")
                 model.load_state_dict(states['model_state'])
+                logger.info(f"Successfully loaded with original model_state (strict=True)")
             except:
                 try:
+                    logger.info(f"Attempting to load state_dict with new_weights (strict=False)...")
                     model.load_state_dict(new_weights, strict=False)
                     print(f"Loaded {load_name} with strict=False")
+                    logger.info(f"Successfully loaded with new_weights (strict=False)")
                     return model
                 except Exception as e:
                     print(f"Failed to load checkpoint: {str(e)}")
+                    logger.error(f"Failed to load checkpoint: {str(e)}")
                     raise e
     else:
+        logger.info(f"Attempting to load state_dict with original model_state (strict=True, no module prefix)...")
         model.load_state_dict(states['model_state'])
+        logger.info(f"Successfully loaded with original model_state (strict=True, no module prefix)")
     logger.info(f"load self-pretrained checkpoints for {load_name}")
 
 def model_complexity(model, args):

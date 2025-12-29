@@ -11,6 +11,9 @@ import time
 import warnings
 from datetime import datetime
 
+# Set NCCL debug level before any other imports
+os.environ["NCCL_DEBUG"] = "WARNING"
+
 # Set wandb to offline mode before any wandb imports
 os.environ["WANDB_MODE"] = "offline"
 os.environ["WANDB_DISABLE_CODE"] = "true"
@@ -63,6 +66,12 @@ def prepare_all():
         type=str,
         default=None,
         help="Checkpoint path for testing or resuming training",
+    )
+    parser.add_argument(
+        "--local-rank",
+        type=int,
+        default=0,
+        help="Local rank for distributed training (auto-set by torch.distributed.launch)"
     )
     parser.add_argument("overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -173,6 +182,10 @@ def seed_everything(seed):
 def main_worker(rank, world_size, cfg, args):
     if not sys.warnoptions:
         warnings.simplefilter("ignore")
+    
+    if hasattr(args, 'local_rank'):
+        rank = args.local_rank
+    
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
     logger_tools.set_args_and_logger(cfg, rank)
@@ -180,9 +193,12 @@ def main_worker(rank, world_size, cfg, args):
     other_tools.print_exp_info(cfg)
 
     # Initialize trainer
+    logger.info(f"Initializing CustomTrainer on GPU {rank}...")
+    cfg.rank = rank
     trainer = __import__(
         f"trainer.generative_trainer", fromlist=["something"]
     ).CustomTrainer(cfg, args)
+    logger.info(f"CustomTrainer initialized successfully on GPU {rank}")
 
     # Resume logic
     resume_epoch = 0
@@ -212,7 +228,9 @@ def main_worker(rank, world_size, cfg, args):
         start_time = time.time()
         for epoch in range(resume_epoch, cfg.solver.epochs + 1):
             if cfg.ddp:
-                trainer.val_loader.sampler.set_epoch(epoch)
+                sampler = getattr(trainer.train_loader, 'sampler', None)
+                if sampler and hasattr(sampler, 'set_epoch'):
+                    sampler.set_epoch(epoch)
 
             if (epoch) % cfg.val_period == 0:
                 if rank == 0:
@@ -234,7 +252,7 @@ def main_worker(rank, world_size, cfg, args):
                 trainer.tracker.reset()
                 trainer.train(epoch)
 
-            if cfg.debug:
+            if cfg.debug and rank == 0:
                 trainer.test(epoch)
 
         # Final cleanup and logging
@@ -250,37 +268,45 @@ def main_worker(rank, world_size, cfg, args):
 
 
 if __name__ == "__main__":
-    # Set up distributed training environment
-    master_addr = "127.0.0.1"
-    master_port = 29500
-
     import socket
 
-    # Function to check if a port is in use
-    def is_port_in_use(port, host="127.0.0.1"):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind((host, port))
-                return False  # Port is available
-            except socket.error:
-                return True  # Port is in use
+    if os.environ.get("LOCAL_RANK") is not None or os.environ.get("WORLD_SIZE") is not None:
+        master_addr = "127.0.0.1"
+        master_port = int(os.environ.get("MASTER_PORT", "29500"))
+        logger.info(f"Using torch.distributed.launch environment: MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
+    else:
+        master_addr = "127.0.0.1"
+        master_port = 29500
 
-    # Find available port
-    while is_port_in_use(master_port):
-        print(f"Port {master_port} is in use, trying next port...")
-        master_port += 1
+        def is_port_in_use(port, host="127.0.0.1"):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind((host, port))
+                    return False
+                except socket.error:
+                    return True
+
+        while is_port_in_use(master_port):
+            print(f"Port {master_port} is in use, trying next port...")
+            master_port += 1
 
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["NCCL_SOCKET_IFNAME"] = "lo"
 
     cfg, args = prepare_all()
 
     if cfg.ddp:
-        mp.set_start_method("spawn", force=True)
-        mp.spawn(
-            main_worker,
-            args=(len(cfg.gpus), cfg, args),
-            nprocs=len(cfg.gpus),
-        )
+        if os.environ.get("LOCAL_RANK") is not None or os.environ.get("WORLD_SIZE") is not None:
+            world_size = int(os.environ.get("WORLD_SIZE", len(cfg.gpus)))
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            main_worker(local_rank, world_size, cfg, args)
+        else:
+            mp.set_start_method("spawn", force=True)
+            mp.spawn(
+                main_worker,
+                args=(len(cfg.gpus), cfg, args),
+                nprocs=len(cfg.gpus),
+            )
     else:
         main_worker(0, 1, cfg, args)
