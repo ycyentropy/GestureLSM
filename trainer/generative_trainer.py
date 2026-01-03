@@ -746,7 +746,7 @@ class CustomTrainer(BaseTrainer):
                     ) * (n - 2 * self.align_mask)
 
                 # Calculate face vertices for loss computation
-                if mode == "test":
+                if mode == "test" or mode == "val":
                     chunk_size = 1024
                     vertices_rec_face_list = []
                     vertices_tar_face_list = []
@@ -1029,7 +1029,7 @@ class CustomTrainer(BaseTrainer):
         os.makedirs(results_save_path, exist_ok=True)
 
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="test", max_iterations=10, save_results=False #True
+            self.test_loader, epoch, mode="test", max_iterations=10, save_results=True
         )
 
         total_length = results["total_length"]
@@ -1074,7 +1074,7 @@ class CustomTrainer(BaseTrainer):
         save video
         """
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="test_render", max_iterations=10, save_results=False #True
+            self.test_loader, epoch, mode="test_render", max_iterations=10, save_results=True
         )
 
     def load_checkpoint(self, checkpoint):

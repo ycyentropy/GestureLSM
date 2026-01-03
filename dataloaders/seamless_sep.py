@@ -91,11 +91,13 @@ class CustomDataset(Dataset):
 
         self.norm = True
         # 使用seamless的归一化文件
-        self.mean = np.load('./mean_std_seamless/seamless_2_312_mean.npy')
-        self.std = np.load('./mean_std_seamless/seamless_2_312_std.npy')
+        self.mean = np.load('./mean_std_seamless/mean_pose.npy')
+        self.std = np.load('./mean_std_seamless/std_pose.npy')
 
-        self.trans_mean = np.load('./trans_stats/trans_mean.npy')
-        self.trans_std = np.load('./trans_stats/trans_std.npy')
+        self.trans_mean = np.load('./mean_std_seamless/mean_trans.npy')
+        self.trans_std = np.load('./mean_std_seamless/std_trans.npy')
+
+
 
     def _scan_seamless_directory(self):
         """扫描seamless数据集的三层目录结构"""
@@ -143,6 +145,9 @@ class CustomDataset(Dataset):
                 right_hand_pose = m_data["smplh:right_hand_pose"].reshape(-1, 45) # [N, 15, 3] -> [N, 45]
                 trans = m_data["smplh:translation"]           # [N, 3]
                 
+                # 将平移数据从厘米转换为米
+                trans = trans / 100.0
+                
                 # 初始化有效性标记
                 N = global_orient.shape[0]
                 is_valid = np.ones(N, dtype=bool)
@@ -152,16 +157,9 @@ class CustomDataset(Dataset):
                     is_valid &= m_data["smplh:is_valid"]
                 
                 # 必须对平移数据进行异常值检测
-                # 使用新的阈值检测方法，范围在-100到100之间
+                # 使用新的阈值检测方法，范围在-1.0到1.0米之间
                 trans_is_valid = self.detect_translation_outliers_threshold(trans)
                 is_valid &= trans_is_valid
-                
-                # 对所有姿态参数进行平滑处理
-                global_orient = self.smooth_outliers(global_orient, is_valid)
-                body_pose = self.smooth_outliers(body_pose, is_valid)
-                left_hand_pose = self.smooth_outliers(left_hand_pose, is_valid)
-                right_hand_pose = self.smooth_outliers(right_hand_pose, is_valid)
-                trans = self.smooth_outliers(trans, is_valid)
                 
                 n_frames = global_orient.shape[0]
 
@@ -320,6 +318,9 @@ class CustomDataset(Dataset):
                 right_hand_pose_full = pose_data["smplh:right_hand_pose"]  # [N, 15, 3]
                 translation_full = pose_data["smplh:translation"]  # [N, 3]
                 
+                # 将平移数据从厘米转换为米
+                translation_full = translation_full / 100.0
+                
                 # 初始化有效性标记
                 N = len(translation_full)
                 is_valid = np.ones(N, dtype=bool)
@@ -329,23 +330,16 @@ class CustomDataset(Dataset):
                     is_valid &= pose_data["smplh:is_valid"]
                 
                 # 必须对平移数据进行异常值检测
-                # 使用新的阈值检测方法，范围在-100到100之间
+                # 使用新的阈值检测方法，范围在-1.0到1.0米之间
                 trans_is_valid = self.detect_translation_outliers_threshold(translation_full)
                 is_valid &= trans_is_valid
                 
-                # 对所有姿态参数进行平滑处理
-                global_orient_smoothed = self.smooth_outliers(global_orient_full, is_valid)
-                body_pose_smoothed = self.smooth_outliers(body_pose_full.reshape(-1, 63), is_valid).reshape(-1, 21, 3)
-                left_hand_pose_smoothed = self.smooth_outliers(left_hand_pose_full.reshape(-1, 45), is_valid).reshape(-1, 15, 3)
-                right_hand_pose_smoothed = self.smooth_outliers(right_hand_pose_full.reshape(-1, 45), is_valid).reshape(-1, 15, 3)
-                translation_smoothed = self.smooth_outliers(translation_full, is_valid)
-                
                 # 采样处理
-                global_orient = global_orient_smoothed[::stride]
-                body_pose = body_pose_smoothed[::stride].reshape(-1, 63)
-                left_hand_pose = left_hand_pose_smoothed[::stride].reshape(-1, 45)
-                right_hand_pose = right_hand_pose_smoothed[::stride].reshape(-1, 45)
-                translation = translation_smoothed[::stride]
+                global_orient = global_orient_full[::stride]
+                body_pose = body_pose_full[::stride].reshape(-1, 63)
+                left_hand_pose = left_hand_pose_full[::stride].reshape(-1, 45)
+                right_hand_pose = right_hand_pose_full[::stride].reshape(-1, 45)
+                translation = translation_full[::stride]
                 # Seamless数据集没有betas字段，使用零向量
                 betas = np.zeros((1, 10), dtype=np.float32)                   # [1, 10]
 
@@ -367,6 +361,11 @@ class CustomDataset(Dataset):
                 pose_matrix = rc.axis_angle_to_matrix(pose_tensor)
                 pose_6d = rc.matrix_to_rotation_6d(pose_matrix)
                 pose_each_file_6d = pose_6d.reshape(-1, 52*6).numpy()  # 312维
+
+                pose_each_file_6d_padded = np.zeros((pose_each_file_6d.shape[0], 330))  # 330维
+                pose_each_file_6d_padded[:, :22*6] = pose_each_file_6d[:, :22*6]  # 前22个关节点
+                pose_each_file_6d_padded[:, 25*6:] = pose_each_file_6d[:, 22*6:]  # 后30个关节点
+                pose_each_file_6d = pose_each_file_6d_padded  # 330维
 
                 self.beatx_during_time += pose_each_file_6d.shape[0]/30
 
@@ -559,14 +558,14 @@ class CustomDataset(Dataset):
         
         return is_valid
     
-    def detect_translation_outliers_threshold(self, translation, lower_bound=-100.0, upper_bound=100.0):
+    def detect_translation_outliers_threshold(self, translation, lower_bound=-1.0, upper_bound=1.0):
         """
         基于简单阈值检测平移数据中的异常值
         
         Args:
-            translation: 平移数据，形状为 (N, 3)
-            lower_bound: 正常值下限（默认-100.0）
-            upper_bound: 正常值上限（默认100.0）
+            translation: 平移数据，形状为 (N, 3)（单位：米）
+            lower_bound: 正常值下限（默认-1.0米）
+            upper_bound: 正常值上限（默认1.0米）
             
         Returns:
             is_valid: 有效性标记，形状为 (N,)

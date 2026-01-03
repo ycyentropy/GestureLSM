@@ -94,6 +94,8 @@ def process_npz_file(file_path, smplx_model, batch_size, device):
     translation = data['smplh:translation']
     is_valid = data['smplh:is_valid']
     
+    translation = translation / 100.0
+    
     # 检测平移数据异常值
     trans_is_valid = detect_translation_outliers_threshold(translation)
     is_valid &= trans_is_valid

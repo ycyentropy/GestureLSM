@@ -368,6 +368,9 @@ def main():
     left_hand_pose = input_data["smplh:left_hand_pose"].reshape(-1, 45)  # (N, 15, 3) -> (N, 45)
     right_hand_pose = input_data["smplh:right_hand_pose"].reshape(-1, 45)  # (N, 15, 3) -> (N, 45)
     translation = input_data["smplh:translation"]  # (N, 3)
+    
+    # 将平移数据从厘米转换为米
+    translation = translation / 100.0
 
     # 组装为156维轴角表示
     poses_axis_angle = assemble_seamless_pose(global_orient, body_pose, left_hand_pose, right_hand_pose)

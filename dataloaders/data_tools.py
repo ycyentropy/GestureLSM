@@ -1569,28 +1569,12 @@ class FIDCalculator(object):
     @staticmethod
     def frechet_distance(samples_A, samples_B):
         A_mu = np.mean(samples_A, axis=0)
+        A_sigma = np.cov(samples_A, rowvar=False)
         B_mu = np.mean(samples_B, axis=0)
-        
-        print(f"frechet_distance: samples_A shape: {samples_A.shape}, samples_B shape: {samples_B.shape}")
-        print(f"frechet_distance: A_mu shape: {A_mu.shape}, B_mu shape: {B_mu.shape}")
-        
-        eps = 1e-2
-        A_sigma_raw = np.cov(samples_A, rowvar=False)
-        B_sigma_raw = np.cov(samples_B, rowvar=False)
-        
-        A_sigma = (A_sigma_raw + A_sigma_raw.T) / 2 + np.eye(samples_A.shape[1]) * eps
-        B_sigma = (B_sigma_raw + B_sigma_raw.T) / 2 + np.eye(samples_B.shape[1]) * eps
-        
-        print(f"frechet_distance: A_sigma shape: {A_sigma.shape}, B_sigma shape: {B_sigma.shape}")
-        
+        B_sigma = np.cov(samples_B, rowvar=False)
         try:
-            frechet_dist = FIDCalculator.calculate_frechet_distance(A_mu, A_sigma, B_mu, B_sigma, eps=eps)
-            print(f"frechet_distance: calculated fgd = {frechet_dist}")
-        except ValueError as e:
-            print(f"frechet_distance: ValueError occurred: {e}")
-            frechet_dist = 1e+10
-        except Exception as e:
-            print(f"frechet_distance: Exception occurred: {e}")
+            frechet_dist = FIDCalculator.calculate_frechet_distance(A_mu, A_sigma, B_mu, B_sigma)
+        except ValueError:
             frechet_dist = 1e+10
         return frechet_dist
 
@@ -1618,9 +1602,10 @@ class FIDCalculator(object):
 
         mu1 = np.atleast_1d(mu1)
         mu2 = np.atleast_1d(mu2)
+        #print(mu1[0], mu2[0])
         sigma1 = np.atleast_2d(sigma1)
         sigma2 = np.atleast_2d(sigma2)
-
+        #print(sigma1[0], sigma2[0])
         assert mu1.shape == mu2.shape, \
             'Training and test mean vectors have different lengths'
         assert sigma1.shape == sigma2.shape, \
@@ -1628,27 +1613,27 @@ class FIDCalculator(object):
 
         diff = mu1 - mu2
 
-        cov_product = sigma1.dot(sigma2)
-        
-        eps = 1e-5
-        offset = np.eye(sigma1.shape[0]) * eps
-        cov_product_reg = cov_product + offset
-        
-        # Use eigenvalue decomposition for computing matrix square root trace
-        eigvals, eigvecs = np.linalg.eigh(cov_product_reg)
-        
-        # Ensure all eigenvalues are positive
-        eigvals = np.clip(eigvals, eps, None)
-        
-        # The trace of sqrt(cov_product_reg) = sum of sqrt(eigenvalues)
-        tr_covmean = np.sum(np.sqrt(eigvals))
+        # Product might be almost singular
+        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+        #print(diff, covmean[0])
+        if not np.isfinite(covmean).all():
+            msg = ('fid calculation produces singular product; '
+                    'adding %s to diagonal of cov estimates') % eps
+            print(msg)
+            offset = np.eye(sigma1.shape[0]) * eps
+            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
-        fd = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
-        
-        # Ensure non-negative result due to numerical precision
-        fd = max(fd, 0.0)
-        
-        return float(fd)
+        # Numerical error might give slight imaginary component
+        if np.iscomplexobj(covmean):
+            if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+                m = np.max(np.abs(covmean.imag))
+                raise ValueError('Imaginary component {}'.format(m))
+            covmean = covmean.real
+
+        tr_covmean = np.trace(covmean)
+
+        return (diff.dot(diff) + np.trace(sigma1) +
+                np.trace(sigma2) - 2 * tr_covmean)
 
     
     def calculate_fid(self, cal_type, joint_type, high_level_opt):

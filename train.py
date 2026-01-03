@@ -79,7 +79,9 @@ def prepare_all():
     # Load config
     if args.config.endswith(".yaml"):
         cfg = OmegaConf.load(args.config)
-        cfg.exp_name = args.config.split("/")[-1][:-5]
+        # Only set exp_name from config filename if not already defined in config
+        if not hasattr(cfg, "exp_name") or cfg.exp_name is None:
+            cfg.exp_name = args.config.split("/")[-1][:-5]
     else:
         raise ValueError(
             "Unsupported config file format. Only .yaml files are allowed."
@@ -186,7 +188,7 @@ def main_worker(rank, world_size, cfg, args):
     if hasattr(args, 'local_rank'):
         rank = args.local_rank
     
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(backend=os.environ.get("TORCH_DISTRIBUTED_BACKEND", "nccl"), rank=rank, world_size=world_size)
 
     logger_tools.set_args_and_logger(cfg, rank)
     seed_everything(cfg.seed)

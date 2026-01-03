@@ -293,7 +293,9 @@ def prepare_all():
     # Load config
     if args.config.endswith(".yaml"):
         cfg = OmegaConf.load(args.config)
-        cfg.exp_name = args.config.split("/")[-1][:-5]
+        # Only set exp_name from config filename if not already defined in config
+        if not hasattr(cfg, "exp_name") or cfg.exp_name is None:
+            cfg.exp_name = args.config.split("/")[-1][:-5]
     else:
         raise ValueError("Unsupported config file format. Only .yaml files are allowed.")
     

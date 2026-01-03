@@ -310,7 +310,7 @@ elif args.body_part == "lower_trans":
     lower_body_mask = []
     for i in joints:
         lower_body_mask.extend([i*6, i*6+1, i*6+2, i*6+3, i*6+4, i*6+5])
-    lower_body_mask.extend([312, 313, 314])  # 添加平移维度
+    lower_body_mask.extend([330, 331, 332])  # 添加平移维度
     mask = lower_body_mask
     rec_mask = list(range(len(mask)))
 
@@ -362,8 +362,8 @@ if args.resume_pth :
 
 ##### ---- Seamless Normalization ---- #####
 # 使用seamless数据集的归一化文件
-mean_pose_path = './mean_std_seamless/seamless_2_312_mean.npy'
-std_pose_path = './mean_std_seamless/seamless_2_312_std.npy'
+mean_pose_path = './mean_std_seamless/mean_pose.npy'
+std_pose_path = './mean_std_seamless/std_pose.npy'
 
 mean_pose = np.load(mean_pose_path)
 std_pose = np.load(std_pose_path)
@@ -375,6 +375,18 @@ mean_pose = torch.from_numpy(mean_pose).to(device)
 std_pose = torch.from_numpy(std_pose).to(device)
 
 logger.info(f"Loaded normalization: mean_pose.shape={mean_pose.shape}, std_pose.shape={std_pose.shape}")
+
+##### ---- Evaluation Model for FID ---- #####
+eval_model_module = __import__(f"models.motion_representation", fromlist=["something"])
+args.vae_layer = 4
+args.vae_length = 240
+args.vae_test_dim = 330
+args.variational = False
+args.data_path_1 = "./datasets/hub/"
+args.vae_grow = [1,1,2,1]
+eval_copy = getattr(eval_model_module, 'VAESKConv')(args).to('cuda')
+other_tools.load_checkpoints(eval_copy, './datasets/BEAT_SMPL/beat_v2.0.0/beat_english_v2.0.0/'+'weights/AESKConv_240_100.bin', 'VAESKConv')
+eval_copy.eval()
 
 if args.mode == 'train':
     net.train()
@@ -407,18 +419,18 @@ if args.mode == 'train':
 
         pred_motion, loss_commit, perplexity = net(gt_motion).values()
         
-        # 打印网络输出值
-        # 只有当loss_commit大于1时才打印
-        if loss_commit.item() > 1:
-            print(f"[DEBUG] loss_commit值: {loss_commit.item()}")
-            # 计算最后三个索引的均值
-            mean_last_three = gt_motion[..., -3:].mean()
-            print(f"[DEBUG] 最后三个索引的均值: {mean_last_three.item()}")
-            # 计算每个索引的均值
-            for i in range(3):
-                idx = -3 + i
-                mean_idx = gt_motion[..., idx].mean()
-                print(f"[DEBUG] 索引 {idx} 的均值: {mean_idx.item()}")
+        # # 打印网络输出值
+        # # 只有当loss_commit大于1时才打印
+        # if loss_commit.item() > 1:
+        #     print(f"[DEBUG] loss_commit值: {loss_commit.item()}")
+        #     # 计算最后三个索引的均值
+        #     mean_last_three = gt_motion[..., -3:].mean()
+        #     print(f"[DEBUG] 最后三个索引的均值: {mean_last_three.item()}")
+        #     # 计算每个索引的均值
+        #     for i in range(3):
+        #         idx = -3 + i
+        #         mean_idx = gt_motion[..., idx].mean()
+        #         print(f"[DEBUG] 索引 {idx} 的均值: {mean_idx.item()}")
         loss_motion = Loss.my_forward(pred_motion, gt_motion,rec_mask)
         # 选择损失函数类型 - 暂时注释掉jitter和velocity损失
         # if args.use_jitter_loss:
@@ -512,6 +524,10 @@ if args.mode == 'train':
 
             logger.info(f"Evaluating at iteration {nb_iter}...")
 
+            latent_out = []
+            latent_ori = []
+            diffs = []
+
             with torch.no_grad():
                 for its, batch_data in enumerate(test_loader):
                     gt_motion = batch_data.to(device).float()
@@ -521,13 +537,13 @@ if args.mode == 'train':
                     if remain != 0:
                         gt_motion = gt_motion[:, :-remain, :]
 
-                    gt_ori = gt_motion
+                    gt_ori = gt_motion.clone()
                     gt_motion = gt_motion[...,mask] # (bs, 64, dim)
                     bs = gt_motion.shape[0]
                     pred_motion, loss_commit, perplexity = net(gt_motion).values()
                     diff = pred_motion - gt_motion
 
-                    pred_motion = pred_motion
+                    # pred_motion = pred_motion
                     rec_motion = gt_ori.clone()
 
                     rec_motion[..., mask] = pred_motion # it is already a 6d tensor
@@ -541,6 +557,19 @@ if args.mode == 'train':
                     # 计算L2距离
                     l2_batch = torch.sqrt(torch.sum(diff ** 2, dim=[1, 2])).mean().item()
                     l2_all += l2_batch
+
+                    # 收集潜在表示用于FID计算
+                    remain = n % 32
+                    latent_out.append(eval_copy.map2latent(rec_motion_part[:, :n-remain]).reshape(-1, 32).detach().cpu().numpy())
+                    latent_ori.append(eval_copy.map2latent(gt_motion_part[:, :n-remain]).reshape(-1, 32).detach().cpu().numpy())
+                    diffs.append(diff[:, :n-remain].reshape(-1, 32).detach().cpu().numpy())
+
+                latent_out_all = np.concatenate(latent_out, axis=0)
+                latent_ori_all = np.concatenate(latent_ori, axis=0)
+                diffs_all = np.concatenate(diffs, axis=0)
+
+                fid = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
+                logger.info(f"FID: {fid:.6f}")
 
                 avg_l2 = l2_all / len(test_loader)
                 logger.info(f"Iteration {nb_iter}: L2 distance: {avg_l2:.6f}")
@@ -598,6 +627,10 @@ else:
 
     logger.info("Running evaluation...")
 
+    latent_out = []
+    latent_ori = []
+    diffs = []
+
     with torch.no_grad():
         for its, batch_data in enumerate(test_loader):
             gt_motion = batch_data.to(device).float()
@@ -607,12 +640,12 @@ else:
             if remain != 0:
                 gt_motion = gt_motion[:, :-remain, :]
 
-            gt_ori = gt_motion
+            gt_ori = gt_motion.clone()
             gt_motion = gt_motion[...,mask] # (bs, 64, dim)
             pred_motion, loss_commit, perplexity = net(gt_motion).values()
             diff = pred_motion - gt_motion
 
-            pred_motion = pred_motion
+            # pred_motion = pred_motion
             rec_motion = gt_ori.clone()
 
             rec_motion[..., mask] = pred_motion # it is already a 6d tensor
@@ -625,6 +658,19 @@ else:
 
             l2_batch = torch.sqrt(torch.sum(diff ** 2, dim=[1, 2])).mean().item()
             l2_all += l2_batch
+
+            # 收集潜在表示用于FID计算
+            remain = n % 32
+            latent_out.append(eval_copy.map2latent(rec_motion_part[:, :n-remain]).reshape(-1, 240).detach().cpu().numpy())
+            latent_ori.append(eval_copy.map2latent(gt_motion_part[:, :n-remain]).reshape(-1, 240).detach().cpu().numpy())
+            diffs.append(diff[:, :n-remain].reshape(-1, 32).detach().cpu().numpy())
+
+        latent_out_all = np.concatenate(latent_out, axis=0)
+        latent_ori_all = np.concatenate(latent_ori, axis=0)
+        diffs_all = np.concatenate(diffs, axis=0)
+
+        fid = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
+        logger.info(f"Evaluation FID: {fid:.6f}")
 
         avg_l2 = l2_all / len(test_loader)
         logger.info(f"Evaluation L2 distance: {avg_l2:.6f}")

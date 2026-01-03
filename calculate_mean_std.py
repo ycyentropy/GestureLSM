@@ -361,6 +361,9 @@ def calculate_mean_std(data_dir, output_dir):
             # 获取平移数据 (3维)
             translation = data['smplh:translation']  # 形状: (frames, 3)
             
+            # 将平移数据从厘米转换为米
+            translation = translation / 100.0
+            
             # 初始化有效性标记
             N = body_pose.shape[0]
             is_valid = np.ones(N, dtype=bool)
@@ -652,10 +655,10 @@ def calculate_mean_std(data_dir, output_dir):
     print(f"平移标准差形状: {trans_std.shape}")
     
     # 保存为npy文件
-    np.save(os.path.join(output_dir, 'seamless_2_330_mean.npy'), pose_mean.astype(np.float32))
-    np.save(os.path.join(output_dir, 'seamless_2_330_std.npy'), pose_std.astype(np.float32))
-    np.save(os.path.join(output_dir, 'seamless_2_trans_mean.npy'), trans_mean)
-    np.save(os.path.join(output_dir, 'seamless_2_trans_std.npy'), trans_std)
+    np.save(os.path.join(output_dir, 'seamless_330_mean.npy'), pose_mean.astype(np.float32))
+    np.save(os.path.join(output_dir, 'seamless_330_std.npy'), pose_std.astype(np.float32))
+    np.save(os.path.join(output_dir, 'seamless_trans_mean.npy'), trans_mean)
+    np.save(os.path.join(output_dir, 'seamless_trans_std.npy'), trans_std)
     
     print("\n=== 过滤后的统计信息摘要 ===")
     print(f"最终姿态数据点数: {filtered_pose.shape[0]}")
