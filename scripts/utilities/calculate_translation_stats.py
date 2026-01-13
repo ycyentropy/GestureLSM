@@ -155,6 +155,9 @@ def calculate_translation_stats(data_dir, output_dir):
             # 获取平移数据
             translation = data['smplh:translation']  # 形状: (frames, 3)
             
+            # 将平移数据从厘米转换为米
+            translation = translation / 100.0
+            
             # 检查帧数量是否为0
             if translation.shape[0] == 0:
                 print(f"跳过文件 {npz_file}，帧数量为0")

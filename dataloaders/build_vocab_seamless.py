@@ -229,8 +229,8 @@ if __name__ == "__main__":
     # 而不是："/datasets/seamless_interaction/improvised/train"
     # data_path = "/path/to/seamless/dataset"  # 请替换为实际的 Seamless 数据集根目录
     data_path = "/home/embodied/yangchenyu/GestureLSM/datasets/seamless_interaction/improvised"
-    cache_path = os.path.join(data_path, "vocab.pkl")
-    word_vec_path = "/home/embodied/yangchenyu/GestureLSM/ckpt/cc.en.300.bin"
+    cache_path = os.path.join(data_path, "weights/new_vocab.pkl")
+    word_vec_path = "/home/embodied/yangchenyu/GestureLSM/ckpt/wiki.en.bin"
 
     print("=== Seamless Dataset Vocabulary Builder ===")
     print(f"Dataset path: {data_path}")

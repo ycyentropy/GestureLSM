@@ -52,6 +52,7 @@ class CustomTrainer(BaseTrainer):
         self.cfg = cfg
         self.args = args
         self.joints = 55
+        self.max_iterations = 50  # 默认值
 
         self.ori_joint_list = joints_list["beat_smplx_joints"]
         self.tar_joint_list_face = joints_list["beat_smplx_face"]
@@ -94,8 +95,8 @@ class CustomTrainer(BaseTrainer):
             ] = 1
 
         self.tracker = other_tools.EpochTracker(
-            ["fgd", "bc", "l1div", "predict_x0_loss", "test_clip_fgd"],
-            [True, True, True, True, True],
+            ["fgd", "bc", "l1div", "l1div_gt", "align_gt", "predict_x0_loss", "test_clip_fgd"],
+            [True, True, True, True, True, True, True],
         )
 
         ##### Model #####
@@ -193,11 +194,11 @@ class CustomTrainer(BaseTrainer):
                 ckpt_state_dict = torch.load(self.args.checkpoint, weights_only=False)[
                     "model_state"
                 ]
-            # remove 'audioEncoder' from the state_dict due to legacy issues
+            # remove 'audioEncoder' from the state_dict due to legacy issues and text_pre_encoder_body due to vocab size mismatch
             ckpt_state_dict = {
                 k: v
                 for k, v in ckpt_state_dict.items()
-                if "modality_encoder.audio_encoder." not in k
+                if "modality_encoder.audio_encoder." not in k and "modality_encoder.text_pre_encoder_body." not in k
             }
             self.model.load_state_dict(ckpt_state_dict, strict=False)
             logger.info(f"Loaded checkpoint from {self.args.checkpoint}")
@@ -291,7 +292,7 @@ class CustomTrainer(BaseTrainer):
         tar_pose_hands = (tar_pose_hands - self.mean_hands) / self.std_hands
         tar_pose_lower = (tar_pose_lower - self.mean_lower) / self.std_lower
 
-        tar_trans_v = (tar_trans_v - self.trans_mean) / self.trans_std
+        # tar_trans_v = (tar_trans_v - self.trans_mean) / self.trans_std 暂时注释，测试效果
         tar_pose_lower = torch.cat([tar_pose_lower, tar_trans_v], dim=-1)
 
         latent_upper_top = self.vq_model_upper.map2latent(tar_pose_upper)
@@ -468,7 +469,7 @@ class CustomTrainer(BaseTrainer):
         rec_lower = self.vq_model_lower.latent2origin(rec_all_lower)[0]
 
         rec_trans_v = rec_lower[..., -3:]
-        rec_trans_v = rec_trans_v * self.trans_std + self.trans_mean
+        # rec_trans_v = rec_trans_v * self.trans_std + self.trans_mean 暂时注释，测试效果
         rec_trans = torch.zeros_like(rec_trans_v)
         rec_trans = torch.cumsum(rec_trans_v, dim=-2)
         rec_trans[..., 1] = rec_trans_v[..., 1]
@@ -585,6 +586,7 @@ class CustomTrainer(BaseTrainer):
         total_length = 0
         test_seq_list = self.test_data.selected_file if hasattr(self.test_data, 'selected_file') else None
         align = 0
+        align_gt = 0
         latent_out = []
         latent_ori = []
         l2_all = 0
@@ -661,14 +663,14 @@ class CustomTrainer(BaseTrainer):
                         
                         latent_out.append(
                             latent_rec
-                            .reshape(-1, self.cfg.vae_length)
+                            .reshape(-1, self.cfg.vae_test_len) #self.cfg.vae_length
                             .detach()
                             .cpu()
                             .numpy()
                         )
                         latent_ori.append(
                             latent_tar
-                            .reshape(-1, self.cfg.vae_length)
+                            .reshape(-1, self.cfg.vae_test_len)
                             .detach()
                             .cpu()
                             .numpy()
@@ -683,6 +685,7 @@ class CustomTrainer(BaseTrainer):
                 # Process in smaller chunks to reduce memory usage
                 chunk_size = 1024  # Adjust based on available memory
                 joints_rec_list = []
+                joints_tar_list = []
                 
                 for i in range(0, bs * n, chunk_size):
                     end_idx = min(i + chunk_size, bs * n)
@@ -700,16 +703,39 @@ class CustomTrainer(BaseTrainer):
                         reye_pose=rec_pose[:, 72:75][i:end_idx],
                     )
                     joints_rec_list.append(vertices_rec["joints"].detach().cpu().numpy())
-                    del vertices_rec
+                    
+                    vertices_tar = self.smplx(
+                        betas=tar_beta.reshape(bs * n, 300)[i:end_idx],
+                        transl=tar_trans.reshape(bs * n, 3)[i:end_idx],
+                        expression=tar_exps.reshape(bs * n, 100)[i:end_idx],
+                        jaw_pose=tar_pose[:, 66:69][i:end_idx],
+                        global_orient=tar_pose[:, :3][i:end_idx],
+                        body_pose=tar_pose[:, 3 : 21 * 3 + 3][i:end_idx],
+                        left_hand_pose=tar_pose[:, 25 * 3 : 40 * 3][i:end_idx],
+                        right_hand_pose=tar_pose[:, 40 * 3 : 55 * 3][i:end_idx],
+                        return_joints=True,
+                        leye_pose=tar_pose[:, 69:72][i:end_idx],
+                        reye_pose=tar_pose[:, 72:75][i:end_idx],
+                    )
+                    joints_tar_list.append(vertices_tar["joints"].detach().cpu().numpy())
+                    
+                    del vertices_rec, vertices_tar
                     torch.cuda.empty_cache()
                 
                 # Concatenate results
                 joints_rec = np.concatenate(joints_rec_list, axis=0)
                 joints_rec = joints_rec.reshape(bs, n, 127 * 3)[0, :n, : 55 * 3]
+                
+                joints_tar = np.concatenate(joints_tar_list, axis=0)
+                joints_tar = joints_tar.reshape(bs, n, 127 * 3)[0, :n, : 55 * 3]
 
-                # Calculate L1 diversity
+                # Calculate L1 diversity for generated poses
                 if self.l1_calculator is not None:
                     _ = self.l1_calculator.run(joints_rec)
+
+                # Calculate L1 diversity for ground truth poses
+                if hasattr(self, "l1_calculator_gt") and self.l1_calculator_gt is not None:
+                    _ = self.l1_calculator_gt.run(joints_tar)
 
                 # Calculate alignment for single batch
                 if (
@@ -743,6 +769,13 @@ class CustomTrainer(BaseTrainer):
                     )
                     align += self.alignmenter.calculate_align(
                         onset_bt, beat_vel, 30
+                    ) * (n - 2 * self.align_mask)
+                    
+                    beat_vel_gt = self.alignmenter.load_pose(
+                        joints_tar, self.align_mask, n - self.align_mask, 30, True
+                    )
+                    align_gt += self.alignmenter.calculate_align(
+                        onset_bt, beat_vel_gt, 30
                     ) * (n - 2 * self.align_mask)
 
                 # Calculate face vertices for loss computation
@@ -917,6 +950,7 @@ class CustomTrainer(BaseTrainer):
         return {
             "total_length": total_length,
             "align": align,
+            "align_gt": align_gt,
             "latent_out": latent_out,
             "latent_ori": latent_ori,
             "l2_all": l2_all,
@@ -926,13 +960,19 @@ class CustomTrainer(BaseTrainer):
 
     def val(self, epoch):
         self.tracker.reset()
+        
+        if self.l1_calculator is not None:
+            self.l1_calculator.reset()
+        if hasattr(self, "l1_calculator_gt") and self.l1_calculator_gt is not None:
+            self.l1_calculator_gt.reset()
 
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="val", max_iterations=10 #原来是15
+            self.test_loader, epoch, mode="val", max_iterations=self.max_iterations
         )
 
         total_length = results["total_length"]
         align = results["align"]
+        align_gt = results["align_gt"]
         latent_out = results["latent_out"]
         latent_ori = results["latent_ori"]
         l2_all = results["l2_all"]
@@ -949,13 +989,27 @@ class CustomTrainer(BaseTrainer):
         logger.info(f"fgd score: {fgd}")
         self.tracker.update_meter("fgd", "val", fgd)
 
-        align_avg = align / (total_length - 2 * len(self.test_loader) * self.align_mask)
+        # 计算实际处理的样本数
+        actual_samples = min(self.max_iterations, len(self.test_loader)) if self.max_iterations is not None else len(self.test_loader)
+        
+        # 使用实际处理的样本数计算分母
+        denominator = total_length - 2 * actual_samples * self.align_mask
+        
+        align_avg = align / denominator
         logger.info(f"align score: {align_avg}")
         self.tracker.update_meter("bc", "val", align_avg)
+        
+        align_gt_avg = align_gt / denominator
+        logger.info(f"align_gt score: {align_gt_avg}")
+        self.tracker.update_meter("align_gt", "val", align_gt_avg)
 
         l1div = self.l1_calculator.avg() if self.l1_calculator is not None else 0.0
         logger.info(f"l1div score: {l1div}")
         self.tracker.update_meter("l1div", "val", l1div)
+        
+        l1div_gt = self.l1_calculator_gt.avg() if hasattr(self, "l1_calculator_gt") and self.l1_calculator_gt is not None else 0.0
+        logger.info(f"l1div_gt score: {l1div_gt}")
+        self.tracker.update_meter("l1div_gt", "val", l1div_gt)
 
         self.val_recording(epoch)
 
@@ -966,10 +1020,15 @@ class CustomTrainer(BaseTrainer):
 
     def test_clip(self, epoch):
         self.tracker.reset()
+        
+        if self.l1_calculator is not None:
+            self.l1_calculator.reset()
+        if hasattr(self, "l1_calculator_gt") and self.l1_calculator_gt is not None:
+            self.l1_calculator_gt.reset()
 
         # Test on CLIP dataset
         results_clip = self._common_test_inference(
-            self.test_clip_loader, epoch, mode="test_clip", max_iterations=10
+            self.test_clip_loader, epoch, mode="test_clip", max_iterations=self.max_iterations
         )
 
         total_length_clip = results_clip["total_length"]
@@ -993,12 +1052,18 @@ class CustomTrainer(BaseTrainer):
         )
 
         # Test on regular test dataset for recording
+        if self.l1_calculator is not None:
+            self.l1_calculator.reset()
+        if hasattr(self, "l1_calculator_gt") and self.l1_calculator_gt is not None:
+            self.l1_calculator_gt.reset()
+        
         results_test = self._common_test_inference(
-            self.test_loader, epoch, mode="test_clip", max_iterations=10
+            self.test_loader, epoch, mode="test_clip", max_iterations=self.max_iterations
         )
 
         total_length = results_test["total_length"]
         align = results_test["align"]
+        align_gt = results_test["align_gt"]
         latent_out = results_test["latent_out"]
         latent_ori = results_test["latent_ori"]
 
@@ -1009,13 +1074,27 @@ class CustomTrainer(BaseTrainer):
         logger.info(f"fgd score: {fgd}")
         self.tracker.update_meter("fgd", "val", fgd)
 
-        align_avg = align / (total_length - 2 * len(self.test_loader) * self.align_mask)
+        # 计算实际处理的样本数
+        actual_samples = min(self.max_iterations, len(self.test_loader)) if self.max_iterations is not None else len(self.test_loader)
+        
+        # 使用实际处理的样本数计算分母
+        denominator = total_length - 2 * actual_samples * self.align_mask
+        
+        align_avg = align / denominator
         logger.info(f"align score: {align_avg}")
         self.tracker.update_meter("bc", "val", align_avg)
+        
+        align_gt_avg = align_gt / denominator
+        logger.info(f"align_gt score: {align_gt_avg}")
+        self.tracker.update_meter("align_gt", "val", align_gt_avg)
 
         l1div = self.l1_calculator.avg() if self.l1_calculator is not None else 0.0
         logger.info(f"l1div score: {l1div}")
         self.tracker.update_meter("l1div", "val", l1div)
+        
+        l1div_gt = self.l1_calculator_gt.avg() if hasattr(self, "l1_calculator_gt") and self.l1_calculator_gt is not None else 0.0
+        logger.info(f"l1div_gt score: {l1div_gt}")
+        self.tracker.update_meter("l1div_gt", "val", l1div_gt)
 
         self.val_recording(epoch)
 
@@ -1027,13 +1106,19 @@ class CustomTrainer(BaseTrainer):
     def test(self, epoch):
         results_save_path = self.checkpoint_path + f"/{epoch}/"
         os.makedirs(results_save_path, exist_ok=True)
+        
+        if self.l1_calculator is not None:
+            self.l1_calculator.reset()
+        if hasattr(self, "l1_calculator_gt") and self.l1_calculator_gt is not None:
+            self.l1_calculator_gt.reset()
 
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="test", max_iterations=10, save_results=True
+            self.test_loader, epoch, mode="test", max_iterations=self.max_iterations, save_results=True
         )
 
         total_length = results["total_length"]
         align = results["align"]
+        align_gt = results["align_gt"]
         latent_out = results["latent_out"]
         latent_ori = results["latent_ori"]
         l2_all = results["l2_all"]
@@ -1045,17 +1130,32 @@ class CustomTrainer(BaseTrainer):
 
         latent_out_all = np.concatenate(latent_out, axis=0)
         latent_ori_all = np.concatenate(latent_ori, axis=0)
+
         fgd = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
         logger.info(f"fgd score: {fgd}")
         self.test_recording("fgd", fgd, epoch)
 
-        align_avg = align / (total_length - 2 * len(self.test_loader) * self.align_mask)
+        # 计算实际处理的样本数
+        actual_samples = min(self.max_iterations, len(self.test_loader)) if self.max_iterations is not None else len(self.test_loader)
+        
+        # 使用实际处理的样本数计算分母
+        denominator = total_length - 2 * actual_samples * self.align_mask
+        
+        align_avg = align / denominator
         logger.info(f"align score: {align_avg}")
         self.test_recording("bc", align_avg, epoch)
+        
+        align_gt_avg = align_gt / denominator
+        logger.info(f"align_gt score: {align_gt_avg}")
+        self.test_recording("align_gt", align_gt_avg, epoch)
 
         l1div = self.l1_calculator.avg() if self.l1_calculator is not None else 0.0
         logger.info(f"l1div score: {l1div}")
         self.test_recording("l1div", l1div, epoch)
+        
+        l1div_gt = self.l1_calculator_gt.avg() if hasattr(self, "l1_calculator_gt") and self.l1_calculator_gt is not None else 0.0
+        logger.info(f"l1div_gt score: {l1div_gt}")
+        self.test_recording("l1div_gt", l1div_gt, epoch)
 
         end_time = time.time() - start_time
         logger.info(
@@ -1074,7 +1174,7 @@ class CustomTrainer(BaseTrainer):
         save video
         """
         results = self._common_test_inference(
-            self.test_loader, epoch, mode="test_render", max_iterations=10, save_results=True
+            self.test_loader, epoch, mode="test_render", max_iterations=self.max_iterations, save_results=True
         )
 
     def load_checkpoint(self, checkpoint):

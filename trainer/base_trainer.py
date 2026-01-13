@@ -137,6 +137,7 @@ class BaseTrainer(object):
         self.alignmenter = metric.alignment(0.3, 7, self.train_data.avg_vel, upper_body=[3,6,9,12,13,14,15,16,17,18,19,20,21]) if self.rank == 0 else None
         self.align_mask = 60
         self.l1_calculator = metric.L1div() if self.rank == 0 else None
+        self.l1_calculator_gt = metric.L1div() if self.rank == 0 else None
         logger.info(f"Alignmenter and l1_calculator created successfully on GPU {self.rank}")
 
     def train_recording(self, epoch, its, t_data, t_train, mem_cost, lr_g, lr_d=None):

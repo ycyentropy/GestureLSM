@@ -5,7 +5,7 @@ Seamless数据集运动重建推理脚本
 该脚本用于seamless数据集单个文件的运动重建，支持：
 1. 读取原始运动数据NPZ文件
 2. 对原始数据进行归一化处理
-3. 分割数据为三种人体部位（upper、lower、hands）
+3. 分割数据为三种人体部位（upper、lower_trans、hands）
 4. 读取对应的三种预训练模型进行推理
 5. 拼接所有部位的预测结果
 6. 经过反归一化得到重建后的运动数据NPZ文件
@@ -80,9 +80,9 @@ def setup_logger(output_dir):
 
 def axis_angle_to_6d(poses_axis_angle):
     """将轴角表示转换为6D旋转表示"""
-    # poses_axis_angle: (seq_len, 156) 轴角表示
-    # 首先重塑为 (seq_len, 52, 3)
-    poses_reshaped = poses_axis_angle.reshape(-1, 52, 3)
+    # poses_axis_angle: (seq_len, 165) 轴角表示
+    # 首先重塑为 (seq_len, 55, 3)
+    poses_reshaped = poses_axis_angle.reshape(-1, 55, 3)
 
     # 转换为torch tensor
     poses_tensor = torch.from_numpy(poses_reshaped)
@@ -93,13 +93,13 @@ def axis_angle_to_6d(poses_axis_angle):
     # 转换为6D表示
     poses_6d = rc.matrix_to_rotation_6d(poses_matrix)
 
-    return poses_6d.reshape(-1, 312).numpy()  # (seq_len, 312)
+    return poses_6d.reshape(-1, 330).numpy()  # (seq_len, 330)
 
 
 def d6_to_axis_angle(poses_6d):
     """将6D旋转表示转换回轴角表示"""
-    # poses_6d: (seq_len, 312) 6D表示
-    poses_6d_reshaped = poses_6d.reshape(-1, 52, 6)
+    # poses_6d: (seq_len, 330) 6D表示
+    poses_6d_reshaped = poses_6d.reshape(-1, 55, 6)
 
     # 转换为torch tensor
     poses_6d_tensor = torch.from_numpy(poses_6d_reshaped)
@@ -108,31 +108,40 @@ def d6_to_axis_angle(poses_6d):
     poses_axis_angle = rc.matrix_to_axis_angle(poses_matrix)
 
     # 转换回numpy
-    return poses_axis_angle.numpy().reshape(-1, 156)  # (seq_len, 156)
+    return poses_axis_angle.numpy().reshape(-1, 165)  # (seq_len, 165)
 
 
 def assemble_seamless_pose(global_orient, body_pose, left_hand_pose, right_hand_pose):
     """组装seamless姿态向量为轴角表示"""
+    N = body_pose.shape[0]
+    shape_padding = np.zeros((N, 9))  # (N, 9) 形状填充
+    
     return np.concatenate([
         global_orient,      # (N, 3)
         body_pose,         # (N, 63)
+        shape_padding,      # (N, 9) 形状填充
         left_hand_pose,     # (N, 45)
         right_hand_pose      # (N, 45)
-    ], axis=1)  # (N, 156)
+    ], axis=1)  # (N, 165)
 
 
 def split_to_body_parts(pose_6d, upper_mask, lower_mask, hand_mask):
     """将6D表示分割为不同身体部位"""
+    N = pose_6d.shape[0]
+    zero_padding = np.zeros((N, 3))  # (N, 3) 三维0向量
+    
+    lower_data = np.concatenate([pose_6d[:, lower_mask[:-3]], zero_padding], axis=1)  # 拼接得到 (N, 57)
+    
     return (
         pose_6d[:, upper_mask],  # 上半身 (N, 78)
-        pose_6d[:, lower_mask],  # 下半身 (N, 54)
+        lower_data,  # 下半身 (N, 57)
         pose_6d[:, hand_mask]   # 手部 (N, 180)
     )
 
 
 def split_axis_angle_to_parts(poses_axis_angle, upper_joints, lower_joints, hand_joints):
     """将轴角表示分割为不同身体部位"""
-    poses_reshaped = poses_axis_angle.reshape(-1, 52, 3)
+    poses_reshaped = poses_axis_angle.reshape(-1, 55, 3)
 
     # 上半身：13个关节点
     upper_pose = poses_reshaped[:, upper_joints, :].reshape(-1, len(upper_joints)*3)
@@ -153,11 +162,11 @@ def reconstruct_full_motion(upper_rec, lower_rec, hands_rec,
     seq_len = upper_rec.shape[0]
 
     # 1. 创建完整姿态容器
-    full_pose = np.zeros((seq_len, 312))
+    full_pose = np.zeros((seq_len, 330))
 
     # 2. 将各部位预测结果回填
     full_pose[:, upper_mask] = upper_rec
-    full_pose[:, lower_mask] = lower_rec
+    full_pose[:, lower_mask[:-3]] = lower_rec[:, :-3]
     full_pose[:, hand_mask] = hands_rec
 
     # 3. 反归一化
@@ -180,12 +189,12 @@ class RVQModelLoader:
             if body_part == 'upper':
                 dim_pose = 13 * 6  # 78维
                 joints = [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
-            elif body_part == 'lower':
-                dim_pose = 9 * 6   # 54维
+            elif body_part == 'lower_trans':
+                dim_pose = 9 * 6 + 3 # 54维
                 joints = [0, 1, 2, 4, 5, 7, 8, 10, 11]
             elif body_part == 'hands':
                 dim_pose = 30 * 6  # 180维
-                joints = list(range(22, 52))
+                joints = list(range(25, 55))
             else:
                 raise ValueError(f"未知的身体部位: {body_part}")
 
@@ -223,16 +232,16 @@ class RVQModelLoader:
     def _create_model_args(self):
         """创建模型参数对象"""
         class Args:
-            # 必需的量化参数
+            # 量化参数
             num_quantizers = 6
             shared_codebook = False
             quantize_dropout_prob = 0.2
 
-            # 必需的架构参数
-            mu = 0.99  # 指数移动平均，用于代码本更新
-            nb_code = 2048  # 代码本大小
-            code_dim = 256  # 代码维度 (与保存的模型匹配)
-            output_emb_width = 256  # 输出嵌入宽度
+            # 架构参数
+            mu = 0.99
+            nb_code = 1024  # 代码本大小
+            code_dim = 128  # 代码维度 (与保存的模型匹配)
+            output_emb_width = 128  # 输出嵌入宽度
             down_t = 2  # 下采样层数
             stride_t = 2  # 时间步长
             width = 512  # 网络宽度
@@ -270,21 +279,21 @@ def get_args_parser():
 
     # 模型路径参数
     parser.add_argument('--upper-model', type=str,
-                        default='outputs/rvq_seamless/seamless_144frame_1024batch_256dim_2048code_upper/net_best.pth',
+                        default='outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_upper/net_best_l2.pth',
                         help='上半身模型路径')
     parser.add_argument('--lower-model', type=str,
-                        default='outputs/rvq_seamless/seamless_144frame_1024batch_256dim_2048code_lower/net_best.pth',
+                        default='outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_lower_trans/net_best_l2.pth',
                         help='下半身模型路径')
     parser.add_argument('--hands-model', type=str,
-                        default='outputs/rvq_seamless/seamless_144frame_1024batch_256dim_2048code_hands/net_best.pth',
+                        default='outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_hands/net_best_l2.pth',
                         help='手部模型路径')
 
     # 归一化参数
     parser.add_argument('--mean-pose', type=str,
-                        default='./mean_std_seamless/seamless_2_312_mean.npy',
+                        default='./mean_std_seamless/mean_pose.npy',
                         help='姿态归一化均值文件路径')
     parser.add_argument('--std-pose', type=str,
-                        default='./mean_std_seamless/seamless_2_312_std.npy',
+                        default='./mean_std_seamless/std_pose.npy',
                         help='姿态归一化标准差文件路径')
 
     # 其他参数
@@ -316,7 +325,7 @@ def main():
     # 2. 验证模型文件
     model_paths = {
         'upper': args.upper_model,
-        'lower': args.lower_model,
+        'lower_trans': args.lower_model,
         'hands': args.hands_model
     }
     logger.info("🔍 验证模型文件...")
@@ -336,10 +345,10 @@ def main():
     # 5. 创建身体部位掩码
     upper_joints = [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]  # 13个关节点
     lower_joints = [0, 1, 2, 4, 5, 7, 8, 10, 11]  # 9个关节点
-    hand_joints = list(range(22, 52))  # 30个关节点
+    hand_joints = list(range(25, 55))  # 30个关节点
 
     upper_mask = [i*6 + j for i in upper_joints for j in range(6)]  # 78维
-    lower_mask = [i*6 + j for i in lower_joints for j in range(6)]  # 54维
+    lower_mask = [i*6 + j for i in lower_joints for j in range(6)] + [330, 331, 332] # 54维 57维度
     hand_mask = [i*6 + j for i in hand_joints for j in range(6)]   # 180维
 
     logger.info(f"👤 身体部位分割:")
@@ -353,7 +362,7 @@ def main():
     # 7. 加载三个模型
     logger.info("🚀 加载预训练模型...")
     model_loader.load_model(args.upper_model, 'upper')
-    model_loader.load_model(args.lower_model, 'lower')
+    model_loader.load_model(args.lower_model, 'lower_trans')
     model_loader.load_model(args.hands_model, 'hands')
 
     logger.info("✅ 所有模型加载完成")
@@ -367,12 +376,12 @@ def main():
     body_pose = input_data["smplh:body_pose"].reshape(-1, 63)  # (N, 21, 3) -> (N, 63)
     left_hand_pose = input_data["smplh:left_hand_pose"].reshape(-1, 45)  # (N, 15, 3) -> (N, 45)
     right_hand_pose = input_data["smplh:right_hand_pose"].reshape(-1, 45)  # (N, 15, 3) -> (N, 45)
-    translation = input_data["smplh:translation"]  # (N, 3)
+    translation = np.zeros_like(input_data["smplh:translation"])  # (N, 3) - 置零
     
-    # 将平移数据从厘米转换为米
-    translation = translation / 100.0
+    # # 将平移数据从厘米转换为米
+    # translation = translation / 100.0
 
-    # 组装为156维轴角表示
+    # 组装为165维轴角表示
     poses_axis_angle = assemble_seamless_pose(global_orient, body_pose, left_hand_pose, right_hand_pose)
     logger.info(f"   原始数据形状: {poses_axis_angle.shape}")
 
@@ -396,7 +405,7 @@ def main():
         upper_rec = process_sequence(upper_data, model_loader.models['upper'], device)
 
         # 下半身推理
-        lower_rec = process_sequence(lower_data, model_loader.models['lower'], device)
+        lower_rec = process_sequence(lower_data, model_loader.models['lower_trans'], device)
 
         # 手部推理
         hands_rec = process_sequence(hands_data, model_loader.models['hands'], device)
@@ -424,8 +433,8 @@ def main():
     # 按照SMPL-X标准格式分割：global_orient(3) + body_pose(63) + left_hand_pose(45) + right_hand_pose(45)
     rec_global_orient = reconstructed_axis_angle[:, :3]  # (N, 3)
     rec_body_pose = reconstructed_axis_angle[:, 3:66].reshape(-1, 63)  # (N, 21, 3) -> (N, 63)
-    rec_left_hand_pose = reconstructed_axis_angle[:, 66:111].reshape(-1, 45)  # (N, 15, 3) -> (N, 45)
-    rec_right_hand_pose = reconstructed_axis_angle[:, 111:156].reshape(-1, 45)  # (N, 15, 3) -> (N, 45)
+    rec_left_hand_pose = reconstructed_axis_angle[:, 75:120].reshape(-1, 45)  # (N, 15, 3) -> (N, 45)
+    rec_right_hand_pose = reconstructed_axis_angle[:, 120:165].reshape(-1, 45)  # (N, 15, 3) -> (N, 45)
     rec_translation = translation  # 保持原始平移不变
 
     logger.info(f"   global_orient形状: {rec_global_orient.shape}")
@@ -473,4 +482,4 @@ def main():
 if __name__ == "__main__":
     main()
     
-# python seamless_motion_reconstruction.py --input-npz V00_S0080_I00000377_P0115.npz --output-npz recon_144_V00_S0080_I00000377_P0115.npz
+# python seamless_motion_reconstruction.py --input-npz V00_S0080_I00000377_P0115.npz --output-npz recon_new_144_V00_S0080_I00000377_P0115.npz

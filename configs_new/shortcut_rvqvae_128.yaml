@@ -1,15 +1,15 @@
 wandb_project: 'GestureLSM'
-exp_name: 'shortcut_rvqvae_128'
+exp_name: 'shortcut_rvqvae_128_test'
 
 wandb_entity: 'xxxx'
 wandb_key: "xxxxxxx"
 wandb_log_dir: './outputs/wandb'
 output_dir: ./outputs/weights
 log_period: 10
-val_period: 20
-gpus: [4,5,6,7]
-seed: 42
-ddp: true
+val_period: 10
+gpus: [0]
+seed: 0 #42
+ddp: false
 debug: false
 
 vqvae_upper_path: ./ckpt/net_300000_upper.pth
@@ -18,7 +18,7 @@ vqvae_lower_path: ./ckpt/net_300000_lower.pth
 
 
 
-grad_ckpt: False # whether to use gradient checkpointing, for memory saving
+grad_ckpt: false # whether to use gradient checkpointing, for memory saving
 
 
 pre_frames: 4
@@ -65,8 +65,8 @@ data:
   audio_rep: onset+amplitude
   word_rep: textgrid
   t_pre_encoder: fasttext
-  facial_rep: smplxflame_30
-  id_rep: onehot
+  facial_rep: null #smplxflame_30
+  id_rep: null #onehot
   emo_rep: null
   sem_rep: null
   test_clip: False
@@ -118,7 +118,7 @@ validation:
 
 solver:
   opt: 'adam'
-  epochs: 1000
+  epochs: 100 #1000
   grad_norm: 1.0
   momentum: 0.8
   nesterov: True

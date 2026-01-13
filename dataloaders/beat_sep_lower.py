@@ -61,7 +61,9 @@ class CustomDataset(Dataset):
         ).cuda().eval()
         
         if self.args.word_rep is not None:
-            with open(f"{self.args.data_path}weights/vocab.pkl", 'rb') as f:
+            vocab_path = "/home/embodied/yangchenyu/GestureLSM/datasets/unified_vocab.pkl"
+            with open(vocab_path, 'rb') as f:
+            # with open(f"{self.args.data_path}weights/vocab.pkl", 'rb') as f: #暂时不用
                 self.lang_model = pickle.load(f)
         
         # Load and process split rules

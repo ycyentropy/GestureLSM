@@ -126,8 +126,8 @@ class CustomDataset(Dataset):
             model_type='smplh',        # 使用SMPLH模型
             gender='neutral',
             use_face_contour=False,    # 关闭面部轮廓
-            num_betas=10,             # 10维形状参数
-            num_expression_coeffs=10,
+            num_betas=300,             # 10维形状参数 
+            num_expression_coeffs=100, #10 
             ext='pkl',                # 使用PKL格式
             use_pca=False,
         ).cuda().eval()
@@ -316,10 +316,11 @@ class CustomDataset(Dataset):
                 body_pose_full = pose_data["smplh:body_pose"]  # [N, 21, 3]
                 left_hand_pose_full = pose_data["smplh:left_hand_pose"]  # [N, 15, 3]
                 right_hand_pose_full = pose_data["smplh:right_hand_pose"]  # [N, 15, 3]
-                translation_full = pose_data["smplh:translation"]  # [N, 3]
+                # translation_full = pose_data["smplh:translation"]  # [N, 3] 暂时不用
+                translation_full = np.zeros_like(pose_data["smplh:translation"])  # [N, 3]
                 
-                # 将平移数据从厘米转换为米
-                translation_full = translation_full / 100.0
+                # # 将平移数据从厘米转换为米
+                # translation_full = translation_full / 100.0 暂时不用
                 
                 # 初始化有效性标记
                 N = len(translation_full)
@@ -329,10 +330,10 @@ class CustomDataset(Dataset):
                 if "smplh:is_valid" in pose_data:
                     is_valid &= pose_data["smplh:is_valid"]
                 
-                # 必须对平移数据进行异常值检测
-                # 使用新的阈值检测方法，范围在-1.0到1.0米之间
-                trans_is_valid = self.detect_translation_outliers_threshold(translation_full)
-                is_valid &= trans_is_valid
+                # # 必须对平移数据进行异常值检测
+                # # 使用新的阈值检测方法，范围在-1.0到1.0米之间
+                # trans_is_valid = self.detect_translation_outliers_threshold(translation_full) 暂时不用
+                # is_valid &= trans_is_valid
                 
                 # 采样处理
                 global_orient = global_orient_full[::stride]
@@ -341,7 +342,7 @@ class CustomDataset(Dataset):
                 right_hand_pose = right_hand_pose_full[::stride].reshape(-1, 45)
                 translation = translation_full[::stride]
                 # Seamless数据集没有betas字段，使用零向量
-                betas = np.zeros((1, 10), dtype=np.float32)                   # [1, 10]
+                betas = np.zeros((1, 300), dtype=np.float32)                   # [1, 10] 改成300
 
                 # 组装完整的姿态向量 (156维)
                 poses = np.concatenate([
@@ -371,14 +372,14 @@ class CustomDataset(Dataset):
 
                 # 处理平移数据
                 trans_each_file = translation.copy()
-                trans_each_file[:,0] = trans_each_file[:,0] - trans_each_file[0,0]
-                trans_each_file[:,2] = trans_each_file[:,2] - trans_each_file[0,2]
+                # trans_each_file[:,0] = trans_each_file[:,0] - trans_each_file[0,0] #暂时不用
+                # trans_each_file[:,2] = trans_each_file[:,2] - trans_each_file[0,2]
                 trans_v_each_file = np.zeros_like(trans_each_file)
-                trans_v_each_file[1:,0] = trans_each_file[1:,0] - trans_each_file[:-1,0]
-                trans_v_each_file[0,0] = trans_v_each_file[1,0]
-                trans_v_each_file[1:,2] = trans_each_file[1:,2] - trans_each_file[:-1,2]
-                trans_v_each_file[0,2] = trans_v_each_file[1,2]
-                trans_v_each_file[:,1] = trans_each_file[:,1]
+                # trans_v_each_file[1:,0] = trans_each_file[1:,0] - trans_each_file[:-1,0] 暂时不用
+                # trans_v_each_file[0,0] = trans_v_each_file[1,0]
+                # trans_v_each_file[1:,2] = trans_each_file[1:,2] - trans_each_file[:-1,2]
+                # trans_v_each_file[0,2] = trans_v_each_file[1,2]
+                # trans_v_each_file[:,1] = trans_each_file[:,1]
 
                 # 形状参数
                 shape_each_file = np.repeat(betas, pose_each_file_6d.shape[0], axis=0)
@@ -462,8 +463,9 @@ class CustomDataset(Dataset):
 
                 if sample_pose.any() != None:
                     # 过滤运动骨架数据
-                    sample_pose, filtering_message = MotionPreprocessor(sample_pose).get()
-                    is_correct_motion = (sample_pose is not None)
+                    # sample_pose, filtering_message = MotionPreprocessor(sample_pose).get()
+                    # is_correct_motion = (sample_pose is not None)
+                    is_correct_motion = True
                     if is_correct_motion or disable_filtering:
                         sample_pose_list.append(sample_pose)
                         sample_shape_list.append(sample_shape)
@@ -505,7 +507,7 @@ class CustomDataset(Dataset):
 
             if self.norm:
                 tar_pose = (tar_pose - self.mean) / self.std
-                trans_v = (trans_v - self.trans_mean) / self.trans_std
+                # trans_v = (trans_v - self.trans_mean) / self.trans_std 暂时不用
 
             if self.loader_type == "test" or self.loader_type == "val":
                 tar_pose = tar_pose.float()
@@ -731,7 +733,7 @@ class MotionPreprocessor:
             return variance
 
         # 手腕关节索引 (需要根据seamless关节配置调整)
-        left_arm_var = get_variance(self.skeletons, 20)  # 左手腕
+        left_arm_var = get_variance(self.skeletons, 20)  # 左手腕 这里不对
         right_arm_var = get_variance(self.skeletons, 41)  # 右手腕
 
         th = 0.0014

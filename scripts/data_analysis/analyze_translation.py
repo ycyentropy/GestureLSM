@@ -24,6 +24,10 @@ for i, npz_file in enumerate(sample_files):
         
         # 获取平移数据
         translation = data['smplh:translation']
+        
+        # 将平移数据从厘米转换为米
+        translation = translation / 100.0
+        
         print(f"\n文件 {i+1}: {os.path.basename(npz_file)}")
         print(f"平移数据形状: {translation.shape}")
         

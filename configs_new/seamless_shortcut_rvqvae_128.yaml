@@ -1,14 +1,14 @@
 wandb_project: 'GestureLSM'
-exp_name: 'seamless_shortcut_rvqvae_128'
+exp_name: 'seamless_shortcut_rvqvae_128_simplify'
 
 wandb_entity: 'xxxx'
 wandb_key: "xxxxxxx"
 wandb_log_dir: './outputs/wandb'
 output_dir: ./outputs/weights
 log_period: 10
-val_period: 50 #20
-gpus: [4,5,6,7]
-seed: 42
+val_period: 10 #20
+gpus: [0,1,2,3,4,5]
+seed: 0
 ddp: true
 debug: false
 
@@ -18,7 +18,7 @@ vqvae_lower_path: ./outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024c
 
 
 
-grad_ckpt: True # whether to use gradient checkpointing, for memory saving 原来是false
+grad_ckpt: false # whether to use gradient checkpointing, for memory saving 原来是false
 
 
 pre_frames: 4
@@ -27,10 +27,10 @@ vqvae_squeeze_scale: 4
 vqvae_latent_scale: 5
 vae_length: 240
 vae_test_len: 32
-mean_pose_path: "./mean_std_seamless/seamless_2_330_mean.npy"
-std_pose_path: "./mean_std_seamless/seamless_2_330_std.npy"
-mean_trans_path: "./mean_std_seamless/seamless_2_trans_mean.npy"
-std_trans_path: "./mean_std_seamless/seamless_2_trans_std.npy"
+mean_pose_path: "./mean_std_seamless/mean_pose.npy"
+std_pose_path: "./mean_std_seamless/std_pose.npy"
+mean_trans_path: "./mean_std_seamless/mean_trans.npy"
+std_trans_path: "./mean_std_seamless/std_trans.npy"
 
 data:
   name_pyfile: "dataloaders.seamless_interaction_dataset"
@@ -47,15 +47,15 @@ data:
   rot6d: True
   pose_dims: 825
   pose_length: 128
-  stride: 100
+  stride: 60
   test_length: 128
-  audio_sr: 48000
-  audio_fps: 48000
+  audio_sr: 16000
+  audio_fps: 16000
   audio_norm: False
   
   data_path_1: ./datasets/hub/
   data_path: ./datasets/seamless_interaction/improvised/
-  training_speakers: [2]
+  # training_speakers: [2]
   additional_data: False
   cache_path: ./datasets/seamless_cache/seamless_smplx_128/
   new_cache: False
@@ -64,10 +64,10 @@ data:
   clean_final_seconds: 0
 
   audio_rep: onset+amplitude
-  word_rep: textgrid
+  word_rep: json #textgrid
   t_pre_encoder: fasttext
-  facial_rep: smplxflame_30
-  id_rep: onehot
+  facial_rep: null #smplxflame_30
+  id_rep: null #onehot
   emo_rep: null
   sem_rep: null
   test_clip: False
@@ -89,7 +89,7 @@ model:
       ff_size: 1024
       num_layers: 8
       num_heads: 4
-      dropout: 0.1
+      dropout: 0.1 #0.1
       activation: "gelu"
       n_seed: 8
       seq_len: 32
@@ -119,20 +119,20 @@ validation:
 
 solver:
   opt: 'adam'
-  epochs: 100 #1000
+  epochs: 1000 #1000
   grad_norm: 1.0
   momentum: 0.8
   nesterov: True
   amsgrad: False
   
   # lr
-  lr_base: 2e-4
+  lr_base: 1e-5 #2e-4
   lr_policy: 'step'
   decay_rate: 0.1
   lr_warmup_steps: 50
   decay_epochs: 500
   warmup_epochs: 0
-  warmup_lr: 5e-4
+  warmup_lr: 1e-6 #5e-4
   lr_min: 1e-7
   weight_decay: 0.0
   opt_betas: [0.5, 0.999]

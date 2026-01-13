@@ -156,23 +156,30 @@ def process_smplx_motion(pose_file, smplx_model, pose_fps, facial_rep=None):
     
     # Extract pose and facial data with same stride
     pose_frames = pose_data["poses"][::stride]
-    facial_frames = pose_data["expressions"][::stride] if facial_rep is not None else None
+    # Check if facial_rep is None (Python None) or "None" (string), use zero values if so
+    if facial_rep :
+        facial_frames = pose_data["expressions"][::stride]
+    else:
+        facial_frames = np.zeros((pose_frames.shape[0], 100))
     
     # Process translations
-    trans = pose_data["trans"][::stride]
-    trans[:,0] = trans[:,0] - trans[0,0]
-    trans[:,2] = trans[:,2] - trans[0,2]
+    # trans = pose_data["trans"][::stride]
+    # trans[:,0] = trans[:,0] - trans[0,0]
+    # trans[:,2] = trans[:,2] - trans[0,2]
+
+    trans = np.zeros_like(pose_data["trans"][::stride]) #测试一下无trans的训练效果
     
     # Calculate translation velocities
     trans_v = np.zeros_like(trans)
-    trans_v[1:,0] = trans[1:,0] - trans[:-1,0]
-    trans_v[0,0] = trans_v[1,0]
-    trans_v[1:,2] = trans[1:,2] - trans[:-1,2]
-    trans_v[0,2] = trans_v[1,2]
-    trans_v[:,1] = trans[:,1]
+    # trans_v[1:,0] = trans[1:,0] - trans[:-1,0]
+    # trans_v[0,0] = trans_v[1,0]
+    # trans_v[1:,2] = trans[1:,2] - trans[:-1,2]
+    # trans_v[0,2] = trans_v[1,2]
+    # trans_v[:,1] = trans[:,1]
     
     # Process shape data
-    shape = np.repeat(pose_data["betas"].reshape(1, 300), pose_frames.shape[0], axis=0)
+    # shape = np.repeat(pose_data["betas"].reshape(1, 300), pose_frames.shape[0], axis=0) 暂时不用
+    shape = np.zeros((pose_frames.shape[0], 300))
     
     # # Calculate contacts
     # contacts = calculate_foot_contacts(pose_data, smplx_model)
@@ -185,7 +192,7 @@ def process_smplx_motion(pose_file, smplx_model, pose_fps, facial_rep=None):
         'trans': trans,
         'trans_v': trans_v,
         'shape': shape,
-        'facial': facial_frames if facial_frames is not None else np.array([-1])
+        'facial': facial_frames # if facial_frames is not None else np.array([-1]) 暂时不用
     }
 
 def calculate_foot_contacts(pose_data, smplx_model):

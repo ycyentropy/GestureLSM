@@ -20,6 +20,13 @@ import warnings
 warnings.filterwarnings('ignore')
 from models.vq.model import RVQVAE
 
+# 设置临时目录到有充足空间的分区
+temp_dir = '/home/embodied/yangchenyu/tmp'
+os.makedirs(temp_dir, exist_ok=True)
+os.environ['TMPDIR'] = temp_dir
+os.environ['TEMP'] = temp_dir
+os.environ['TMP'] = temp_dir
+
 # 防止被当作配置文件解析
 if __name__ != "__main__":
     print("This script should be executed directly, not imported.")
@@ -259,12 +266,13 @@ logger.info("="*60)
 train_loader = torch.utils.data.DataLoader(trainSet,
                                               args.batch_size,
                                               shuffle=True,
-                                              num_workers=8,
-                                              drop_last = True)
+                                              num_workers=2,
+                                              drop_last = True,
+                                              persistent_workers=True)
 test_loader = torch.utils.data.DataLoader(testSet,
                                           1,
                                             shuffle=False,
-                                            num_workers=8,
+                                            num_workers=0,
                                             drop_last = True)
 
 def cycle(iterable):
@@ -467,7 +475,9 @@ if args.mode == 'train':
     logger.info(f"Starting main training for {args.total_iter} iterations...")
 
     best_l2 = 10000
+    best_fid = 10000
     l2_history = []
+    fid_history = []
     early_stop_patience = 5
     early_stop_counter = 0
 
@@ -576,10 +586,11 @@ if args.mode == 'train':
 
                 # Add current L2 to history
                 l2_history.append(avg_l2)
+                fid_history.append(fid)
 
                 # Check for early stopping
                 if len(l2_history) > early_stop_patience:
-                    if best_l2 <= min(l2_history[-early_stop_patience:]):
+                    if best_l2 <= min(l2_history[-early_stop_patience:]) and best_fid <= min(fid_history[-early_stop_patience:]):
                         early_stop_counter += 1
                         logger.info(f"Early stopping counter: {early_stop_counter}/{early_stop_patience}")
                         if early_stop_counter >= early_stop_patience:
@@ -588,22 +599,59 @@ if args.mode == 'train':
                     else:
                         early_stop_counter = 0
 
+                # 根据 L2 保存最佳模型
                 if avg_l2 < best_l2:
                     best_l2 = avg_l2
-                    torch.save({'net' : net.state_dict()}, os.path.join(args.out_dir, 'net_best.pth'))
-                    logger.info(f"New best L2: {best_l2:.6f} - saved best model")
+                    torch.save({'net' : net.state_dict()}, os.path.join(args.out_dir, 'net_best_l2.pth'))
+                    logger.info(f"New best L2: {best_l2:.6f} - saved best model (L2)")
+
+                # 根据 FID 保存最佳模型
+                if fid < best_fid:
+                    best_fid = fid
+                    torch.save({'net' : net.state_dict()}, os.path.join(args.out_dir, 'net_best_fid.pth'))
+                    logger.info(f"New best FID: {best_fid:.6f} - saved best model (FID)")
 
                 # 记录L2历史
                 import matplotlib.pyplot as plt
+                # plt.figure()
+                # iterations = list(range(len(l2_history)))
+                # iterations = [x * args.eval_iter for x in iterations]
+                # plt.plot(iterations, l2_history, label='L2 Distance')
+                # plt.xlabel('Iteration')
+                # plt.ylabel('L2 Distance')
+                # plt.title('L2 Distance over Iterations')
+                # plt.legend()
+                # plt.savefig(os.path.join(args.out_dir, 'l2_plot.png'))
+                # plt.close()
+
+                # # 记录FID历史
+                # plt.figure()
+                # iterations = list(range(len(fid_history)))
+                # iterations = [x * args.eval_iter for x in iterations]
+                # plt.plot(iterations, fid_history, label='FID', color='orange')
+                # plt.xlabel('Iteration')
+                # plt.ylabel('FID')
+                # plt.title('FID over Iterations')
+                # plt.legend()
+                # plt.savefig(os.path.join(args.out_dir, 'fid_plot.png'))
+                # plt.close()
+
+                # 记录L2和FID对比历史
                 plt.figure()
                 iterations = list(range(len(l2_history)))
                 iterations = [x * args.eval_iter for x in iterations]
-                plt.plot(iterations, l2_history, label='L2 Distance')
-                plt.xlabel('Iteration')
-                plt.ylabel('L2 Distance')
-                plt.title('L2 Distance over Iterations')
-                plt.legend()
-                plt.savefig(os.path.join(args.out_dir, 'l2_plot.png'))
+                fig, ax1 = plt.subplots()
+                ax1.set_xlabel('Iteration')
+                ax1.set_ylabel('L2 Distance', color='tab:blue')
+                ax1.plot(iterations, l2_history, color='tab:blue', label='L2 Distance')
+                ax1.tick_params(axis='y', labelcolor='tab:blue')
+                ax2 = ax1.twinx()
+                ax2.set_ylabel('FID', color='tab:orange')
+                ax2.plot(iterations, fid_history, color='tab:orange', label='FID')
+                ax2.tick_params(axis='y', labelcolor='tab:orange')
+                plt.title('L2 Distance and FID over Iterations')
+                fig.tight_layout()
+                plt.savefig(os.path.join(args.out_dir, 'l2_fid_plot.png'))
                 plt.close()
 
             net.train()

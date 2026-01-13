@@ -103,7 +103,7 @@ def visualize_seamless_npz(npz_path, output_dir, model_path, fps=30, device='cud
             'body_pose': torch.tensor(data['smplh:body_pose'][i].reshape(-1), dtype=torch.float32, device=device).unsqueeze(0),
             'left_hand_pose': torch.tensor(data['smplh:left_hand_pose'][i].reshape(-1), dtype=torch.float32, device=device).unsqueeze(0),
             'right_hand_pose': torch.tensor(data['smplh:right_hand_pose'][i].reshape(-1), dtype=torch.float32, device=device).unsqueeze(0),
-            'transl': torch.tensor(data['smplh:translation'][i], dtype=torch.float32, device=device).unsqueeze(0),
+            'transl': torch.tensor(data['smplh:translation'][i] / 100.0, dtype=torch.float32, device=device).unsqueeze(0),
             'betas': torch.zeros(1, 10, device=device),  # 使用默认体型
         }
         
