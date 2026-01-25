@@ -24,6 +24,8 @@ class GestureDenoiser(nn.Module):
         use_exp=False,
         seq_len=32,
         embed_context_multiplier=4,
+        use_id=False,
+        id_embedding_dim=256,
     
     ):
         super().__init__()
@@ -37,11 +39,26 @@ class GestureDenoiser(nn.Module):
         self.activation = activation
         self.use_exp = use_exp
         self.joint_num = 3 if not self.use_exp else 4
+        self.use_id = use_id
+        self.id_embedding_dim = id_embedding_dim
+        self.n_seed = n_seed
+        self.seq_len = seq_len
+        self.embed_context_multiplier = embed_context_multiplier
         
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
 
+        # The context dimension for cross attention is determined dynamically in forward pass
+        # We'll use a placeholder here and adjust it in the forward method if needed
+        self.cross_attn_context_dim = self.input_dim * self.joint_num * self.embed_context_multiplier
+
         self.cross_attn_blocks = nn.ModuleList([
-            CrossAttentionBlock(dim=self.latent_dim*self.joint_num,num_heads=self.num_heads,mlp_ratio=self.ff_size//self.latent_dim,drop_path=self.dropout) #hidden是对应于输入x的维度，attn_heads应该是12，这里写1是为了方便调试流程
+            CrossAttentionBlock(
+                dim=self.latent_dim*self.joint_num,
+                num_heads=self.num_heads,
+                mlp_ratio=self.ff_size//self.latent_dim,
+                drop_path=self.dropout,
+                context_dim=self.cross_attn_context_dim
+            ) #hidden是对应于输入x的维度，attn_heads应该是12，这里写1是为了方便调试流程
                 for _ in range(3)])
         
         self.mytimmblocks = nn.ModuleList([
@@ -49,9 +66,6 @@ class GestureDenoiser(nn.Module):
                 for _ in range(self.num_layers)])
             
         self.embed_timestep = TimestepEmbedder(self.latent_dim, self.sequence_pos_encoder)
-        self.n_seed = n_seed
-        self.seq_len = seq_len
-        self.embed_context_multiplier = embed_context_multiplier
         
         self.embed_text = nn.Linear(self.input_dim * self.joint_num * self.embed_context_multiplier, self.latent_dim)
 
@@ -65,14 +79,57 @@ class GestureDenoiser(nn.Module):
         time_dim = self.latent_dim
         self.time_proj = Timesteps(time_dim, flip_sin_to_cos, freq_shift)
         if cond_proj_dim is not None:
-            self.cond_proj = Timesteps(time_dim, flip_sin_to_cos, freq_shift)
+            self.cond_proj = Timesteps(cond_proj_dim, flip_sin_to_cos, freq_shift)
         
         # Null condition embedding for classifier-free guidance
+        # The actual dimension will be adjusted in forward pass if needed
         self.null_cond_embed = nn.Parameter(torch.zeros(self.seq_len, self.latent_dim*self.joint_num), requires_grad=True)
 
     # dropout mask
     def prob_mask_like(self, shape, prob, device):
         return torch.zeros(shape, device=device).float().uniform_(0, 1) < prob
+    
+    def get_null_cond_embed(self, target_dim, device):
+        """
+        Get or create a null condition embedding with the target dimension.
+        If the current null_cond_embed doesn't match the target dimension,
+        create a new one with the correct dimension, preserving the existing
+        learnable parameters where possible.
+        
+        Args:
+            target_dim: Target embedding dimension
+            device: Device to use
+            
+        Returns:
+            null_cond_embed: Null condition embedding with matching dimension
+        """
+        current_dim = self.null_cond_embed.shape[1]
+        
+        if current_dim == target_dim:
+            # Already matches target dimension, return as-is
+            return self.null_cond_embed.to(device)
+        
+        # Create a new null_cond_embed with the target dimension
+        new_null_embed = nn.Parameter(
+            torch.zeros(self.seq_len, target_dim, device=device),
+            requires_grad=True
+        )
+        
+        # Copy existing parameters if target_dim is larger than current_dim
+        if target_dim > current_dim:
+            new_null_embed.data[:, :current_dim] = self.null_cond_embed.to(device)
+            # Initialize the new part with small random values instead of zeros
+            new_null_embed.data[:, current_dim:] = torch.randn(
+                self.seq_len, target_dim - current_dim, device=device
+            ) * 0.01
+        else:
+            # If target_dim is smaller, truncate the existing embedding
+            new_null_embed.data = self.null_cond_embed.to(device)[:, :target_dim]
+        
+        # Update the module's null_cond_embed
+        self.null_cond_embed = new_null_embed
+        
+        return self.null_cond_embed
 
 
     def forward(self, x, timesteps, cond_time=None, seed=None, at_feat=None):

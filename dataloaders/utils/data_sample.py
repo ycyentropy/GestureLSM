@@ -178,23 +178,51 @@ def extract_sample_data(idx, clip_info, cut_length, args,
     has_sem_rep = hasattr(args, 'sem_rep')
     has_id_rep = hasattr(args, 'id_rep')
     
+    # Helper function to safely slice data
+    def safe_slice(data, s, e):
+        # Check if data is a numpy array
+        if not isinstance(data, np.ndarray):
+            return np.array([-1])
+        
+        # Get data length
+        data_len = len(data)
+        
+        # If data has only one element, return it directly (for shape, etc.)
+        if data_len == 1:
+            return data
+        
+        # Ensure slice indices are within bounds
+        s = max(0, s)
+        e = min(data_len, e)
+        
+        # Return empty array if slice is invalid
+        if s >= e:
+            return np.array([-1])
+        
+        return data[s:e]
+    
     sample_data = {
-        'pose': pose_data[start_idx:fin_idx],
-        'trans': trans_data[start_idx:fin_idx],
-        'trans_v': trans_v_data[start_idx:fin_idx],
-        'shape': shape_data[start_idx:fin_idx],
-        'facial': facial_data[start_idx:fin_idx] if (has_facial_rep and args.facial_rep is not None) else np.array([-1]),
-        'word': word_data[start_idx:fin_idx] if (has_word_rep and args.word_rep is not None) else np.array([-1]),
-        'emo': emo_data[start_idx:fin_idx] if (has_emo_rep and args.emo_rep is not None) else np.array([-1]),
-        'sem': sem_data[start_idx:fin_idx] if (has_sem_rep and args.sem_rep is not None) else np.array([-1]),
-        'vid': vid_data[start_idx:fin_idx] if (has_id_rep and args.id_rep is not None) else np.array([-1]),
+        'pose': safe_slice(pose_data, start_idx, fin_idx),
+        'trans': safe_slice(trans_data, start_idx, fin_idx),
+        'trans_v': safe_slice(trans_v_data, start_idx, fin_idx),
+        'shape': safe_slice(shape_data, start_idx, fin_idx),
+        'facial': safe_slice(facial_data, start_idx, fin_idx) if (has_facial_rep and args.facial_rep is not None) else np.array([-1]),
+        'word': safe_slice(word_data, start_idx, fin_idx) if (has_word_rep and args.word_rep is not None) else np.array([-1]),
+        'emo': safe_slice(emo_data, start_idx, fin_idx) if (has_emo_rep and args.emo_rep is not None) else np.array([-1]),
+        'sem': safe_slice(sem_data, start_idx, fin_idx) if (has_sem_rep and args.sem_rep is not None) else np.array([-1]),
+        'vid': safe_slice(vid_data, start_idx, fin_idx) if (has_id_rep and args.id_rep is not None) else np.array([-1]),
         'audio_name': audio_file
     }
     
     if audio_data is not None:
         audio_start = clip_info['clip_s_f_audio'] + math.floor(idx * args.stride * args.audio_fps / args.pose_fps)
         audio_end = audio_start + audio_short_length
-        sample_data['audio'] = audio_data[audio_start:audio_end]
+        
+        # Ensure audio slice indices are within bounds
+        audio_start = max(0, audio_start)
+        audio_end = min(len(audio_data), audio_end)
+        
+        sample_data['audio'] = audio_data[audio_start:audio_end] if audio_start < audio_end else np.array([-1])
     else:
         sample_data['audio'] = np.array([-1])
     

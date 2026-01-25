@@ -226,6 +226,20 @@ def main_worker(rank, world_size, cfg, args):
     elif args.mode == "test":
         logger.info("Testing ...")
 
+    # Early stopping initialization
+    early_stopping_enabled = cfg.solver.get("early_stopping", {}).get("enabled", False)
+    if early_stopping_enabled:
+        patience = cfg.solver.early_stopping.get("patience", 10)
+        delta = cfg.solver.early_stopping.get("delta", 0.001)
+        early_stopping_counter = 0
+        # Initialize previous best metrics with current val_best
+        best_metrics = trainer.val_best.copy()
+        logger.info(f"Early stopping enabled with patience={patience}, delta={delta}")
+    else:
+        # 初始化变量以避免在广播时出现 NameError
+        early_stopping_counter = 0
+        patience = float('inf')  # 设置为无穷大，确保不会触发早停
+
     if args.mode == "train":
         start_time = time.time()
         for epoch in range(resume_epoch, cfg.solver.epochs + 1):
@@ -235,11 +249,71 @@ def main_worker(rank, world_size, cfg, args):
                     sampler.set_epoch(epoch)
 
             if (epoch) % cfg.val_period == 0:
+                # 分布式环境下，同步所有进程
+                if cfg.ddp:
+                    dist.barrier()
+                
                 if rank == 0:
                     if cfg.data.test_clip:
                         trainer.test_clip(epoch)
                     else:
                         trainer.val(epoch)
+
+                    # Early stopping check
+                    if early_stopping_enabled:
+                        # Check all non-gt metrics for improvement
+                        all_no_improve = True
+                        
+                        # Check fgd (lower is better)
+                        if trainer.val_best["fgd"]["value"] < best_metrics["fgd"]["value"] - delta:
+                            all_no_improve = False
+                        
+                        # Check bc (higher is better)
+                        if trainer.val_best["bc"]["value"] > best_metrics["bc"]["value"] + delta:
+                            all_no_improve = False
+                        
+                        # Check l1div (higher is better)
+                        if trainer.val_best["l1div"]["value"] > best_metrics["l1div"]["value"] + delta:
+                            all_no_improve = False
+                        
+                        # Check test_clip_fgd if applicable (lower is better)
+                        if "test_clip_fgd" in trainer.val_best and "test_clip_fgd" in best_metrics:
+                            if trainer.val_best["test_clip_fgd"]["value"] < best_metrics["test_clip_fgd"]["value"] - delta:
+                                all_no_improve = False
+                        
+                        if all_no_improve:
+                            early_stopping_counter += 1
+                            logger.info(f"Early stopping counter: {early_stopping_counter}/{patience}")
+                            if early_stopping_counter >= patience:
+                                logger.info(f"Early stopping triggered after {epoch} epochs")
+                                # Save final checkpoint
+                                trainer.save_checkpoint(
+                                    epoch=epoch,
+                                    iteration=epoch * len(trainer.train_loader),
+                                    is_best=False,
+                                    best_metric_name=None
+                                )
+                                # 早停触发，跳过后续评估，直接进入广播阶段
+                        else:
+                            early_stopping_counter = 0
+                            # Update best metrics if any improvement
+                            best_metrics = trainer.val_best.copy()
+                            logger.info("Early stopping counter reset")
+                
+                # 分布式环境下，广播早停信号给所有进程
+                if cfg.ddp:
+                    # 主进程决定是否需要早停
+                    if rank == 0 and early_stopping_enabled:
+                        should_stop = 1 if early_stopping_counter >= patience else 0
+                    else:
+                        should_stop = 0
+                    
+                    early_stop_signal = torch.tensor([should_stop], dtype=torch.int, device=trainer.model.device)
+                    dist.broadcast(early_stop_signal, src=0)
+                    
+                    if early_stop_signal.item() == 1:
+                        logger.info(f"Received early stopping signal from rank 0, exiting after epoch {epoch}")
+                        return  # Exit training loop
 
             epoch_time = time.time() - start_time
             if trainer.rank == 0:

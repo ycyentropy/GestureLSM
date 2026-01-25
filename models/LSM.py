@@ -1,6 +1,7 @@
 import time
 import inspect
 import logging
+import copy
 from typing import Optional
 
 import scipy.stats as stats
@@ -117,9 +118,19 @@ class GestureLSM(torch.nn.Module):
         super().__init__()
         self.cfg = cfg
 
+        # Add ID embedding layer configuration first to pass to denoiser
+        self.use_id = cfg.model.get("use_id", True)
+        self.max_id = cfg.model.get("max_id", 5000)  # 实际统计到最大ID是4544，预留5000个ID空间
+        self.id_embedding_dim = cfg.model.get("id_embedding_dim", 256)  # 与denoiser潜在维度保持一致
+        
+        # Modify denoiser config to include ID-related parameters
+        denoiser_cfg = copy.deepcopy(cfg.model.denoiser)
+        denoiser_cfg.params.use_id = self.use_id
+        denoiser_cfg.params.id_embedding_dim = self.id_embedding_dim
+
         # Initialize model components
         self.modality_encoder = instantiate_from_config(cfg.model.modality_encoder)
-        self.denoiser = instantiate_from_config(cfg.model.denoiser)
+        self.denoiser = instantiate_from_config(denoiser_cfg)
 
         # Model hyperparameters
         self.do_classifier_free_guidance = cfg.model.do_classifier_free_guidance
@@ -141,6 +152,9 @@ class GestureLSM(torch.nn.Module):
             "x1",
         ], f"Flow mode must be 'v' or 'x1', got {self.flow_mode}"
         logger.info(f"Using flow mode: {self.flow_mode}")
+        
+        # Initialize ID embeddings
+        self.id_embeddings = nn.Embedding(self.max_id, self.id_embedding_dim)
         
 
 
@@ -180,16 +194,19 @@ class GestureLSM(torch.nn.Module):
         
         # Properly expand timesteps to match doubled batch size
         batch_size = x.shape[0]
-        timesteps_doubled = timesteps.expand(batch_size * 2)
+        timesteps_doubled = timesteps.repeat(batch_size)
         
         if cond_time is not None:
-            cond_time_doubled = cond_time.expand(batch_size * 2)
+            cond_time_doubled = cond_time.repeat(batch_size)
         else:
             cond_time_doubled = None
         
         # Create conditional and unconditional audio features
         batch_size = at_feat.shape[0]
-        null_cond_embed = self.denoiser.null_cond_embed.to(at_feat.dtype)
+        
+        # Get null condition embedding with matching dimension from denoiser
+        null_cond_embed = self.denoiser.get_null_cond_embed(at_feat.shape[-1], at_feat.device)
+        
         at_feat_uncond = null_cond_embed.unsqueeze(0).expand(batch_size, -1, -1)
         at_feat_combined = torch.cat([at_feat, at_feat_uncond], dim=0)
         
@@ -224,8 +241,8 @@ class GestureLSM(torch.nn.Module):
         # Create dropout mask
         keep_mask = torch.rand(batch_size, device=at_feat.device) > cond_drop_prob
         
-        # Create null condition embeddings
-        null_cond_embed = self.denoiser.null_cond_embed.to(at_feat.dtype)
+        # Create null condition embeddings with matching dimension
+        null_cond_embed = self.denoiser.get_null_cond_embed(at_feat.shape[-1], at_feat.device)
         
         # Apply dropout: replace dropped conditions with null embeddings
         at_feat_dropped = at_feat.clone()
@@ -246,8 +263,8 @@ class GestureLSM(torch.nn.Module):
         """
         batch_size = at_feat.shape[0]
         
-        # Create null condition embeddings
-        null_cond_embed = self.denoiser.null_cond_embed.to(at_feat.dtype)
+        # Create null condition embeddings with matching dimension
+        null_cond_embed = self.denoiser.get_null_cond_embed(at_feat.shape[-1], at_feat.device)
         
         # Apply forced dropout: replace forced conditions with null embeddings
         at_feat_forced = at_feat.clone()
@@ -282,6 +299,32 @@ class GestureLSM(torch.nn.Module):
         
         # Encode input modalities
         audio_features = self.modality_encoder(audio, word_tokens, wavlm_features)
+        
+        # Process ID information if enabled
+        if self.use_id and ids is not None:
+            # Get the first frame's ID from the sequence
+            if len(ids.shape) > 1:
+                # ID is a sequence, take the first frame's ID
+                first_frame_id = ids[:, 0]
+                # If first_frame_id is still a sequence (one-hot), convert to integer index
+                if len(first_frame_id.shape) > 1:
+                    first_frame_id = torch.argmax(first_frame_id, dim=-1)
+            else:
+                # ID is already a single value per batch
+                first_frame_id = ids
+            
+            # Ensure ID indices are within valid range
+            id_idx = torch.clamp(first_frame_id, 0, self.max_id - 1).long()
+            
+            # Generate ID embeddings
+            id_emb = self.id_embeddings(id_idx)
+            
+            # Expand ID embeddings to match the sequence length of audio features
+            id_emb_expanded = id_emb.unsqueeze(1).repeat(1, audio_features.shape[1], 1)
+            
+            # Concatenate ID embeddings with audio features
+            audio_features = torch.cat([audio_features, id_emb_expanded], dim=-1)
+            
         return_dict['at_feat'] = audio_features
 
         # Initialize generation
@@ -335,6 +378,15 @@ class GestureLSM(torch.nn.Module):
             Dictionary containing individual and total losses
         """
 
+        # DEBUG: Check latents for NaN
+        # if latents.device.index == 0:
+        #     if torch.isnan(latents).any():
+        #         print(f"[DEBUG] NaN detected in latents! nan_count: {torch.isnan(latents).sum().item()}")
+        #         print(f"[DEBUG] latents min: {latents[~torch.isnan(latents)].min() if not torch.all(torch.isnan(latents)) else 'all_nan'}")
+        #         print(f"[DEBUG] latents max: {latents[~torch.isnan(latents)].max() if not torch.all(torch.isnan(latents)) else 'all_nan'}")
+        #     else:
+        #         print(f"[DEBUG] latents OK - min: {latents.min():.6f}, max: {latents.max():.6f}")
+
         # Extract input features
         audio = condition_dict['y']['audio_onset']
         word_tokens = condition_dict['y']['word']
@@ -344,6 +396,31 @@ class GestureLSM(torch.nn.Module):
     
         # Encode input modalities
         audio_features = self.modality_encoder(audio, word_tokens)
+        
+        # Process ID information if enabled
+        if self.use_id and instance_ids is not None:
+            # Get the first frame's ID from the sequence
+            if len(instance_ids.shape) > 1:
+                # ID is a sequence, take the first frame's ID
+                first_frame_id = instance_ids[:, 0]
+                # If first_frame_id is still a sequence (one-hot), convert to integer index
+                if len(first_frame_id.shape) > 1:
+                    first_frame_id = torch.argmax(first_frame_id, dim=-1)
+            else:
+                # ID is already a single value per batch
+                first_frame_id = instance_ids
+            
+            # Ensure ID indices are within valid range
+            id_idx = torch.clamp(first_frame_id, 0, self.max_id - 1).long()
+            
+            # Generate ID embeddings
+            id_emb = self.id_embeddings(id_idx)
+            
+            # Expand ID embeddings to match the sequence length of audio features
+            id_emb_expanded = id_emb.unsqueeze(1).repeat(1, audio_features.shape[1], 1)
+            
+            # Concatenate ID embeddings with audio features
+            audio_features = torch.cat([audio_features, id_emb_expanded], dim=-1)
 
         # Initialize noise
         x0_noise = torch.randn_like(latents)
@@ -364,10 +441,26 @@ class GestureLSM(torch.nn.Module):
         d = deltas[delta_probs.multinomial(batch_size, replacement=True)]
         d[:flow_batch_size] = 0
 
+        # DEBUG: Check t distribution
+        # if latents.device.index == 0:  # Only print on main GPU
+        #     print(f"[DEBUG] t min: {t.min():.6f}, max: {t.max():.6f}, mean: {t.mean():.6f}")
+
         # Prepare inputs
         t_coef = reshape_coefs(t)
         x_t = t_coef * latents + (1 - t_coef) * x0_noise
         t = t_coef.flatten()
+
+        # DEBUG: Check after reshape
+        # if latents.device.index == 0:
+        #     print(f"[DEBUG] t after reshape min: {t.min():.6f}, max: {t.max():.6f}")
+        #     print(f"[DEBUG] flow_batch_size: {flow_batch_size}, t[:flow_batch_size] min: {t[:flow_batch_size].min():.6f}")
+        
+        # DEBUG: Check x_t for NaN
+        # if latents.device.index == 0:
+        #     if torch.isnan(x_t).any():
+        #         print(f"[DEBUG] NaN detected in x_t! nan_count: {torch.isnan(x_t).sum().item()}")
+        #     else:
+        #         print(f"[DEBUG] x_t OK - min: {x_t.min():.6f}, max: {x_t.max():.6f}")
         
         # Flow matching loss
         model_output = self.denoiser(
@@ -378,18 +471,39 @@ class GestureLSM(torch.nn.Module):
             cond_time=d[:flow_batch_size],
         )
         
+        # DEBUG: Check model_output for NaN
+        # if latents.device.index == 0:
+        #     if torch.isnan(model_output).any():
+        #         print(f"[DEBUG] NaN detected in model_output! nan_count: {torch.isnan(model_output).sum().item()}")
+        #     else:
+        #         print(f"[DEBUG] model_output OK - min: {model_output.min():.6f}, max: {model_output.max():.6f}")
+        
         losses = {}
         
         if self.flow_mode == "v":
             # Velocity prediction mode (original)
             flow_target = latents[:flow_batch_size] - x0_noise[:flow_batch_size]
-            flow_loss = (
-                F.mse_loss(flow_target, model_output) / t[:flow_batch_size]
-            ).mean()
+            mse_loss = F.mse_loss(flow_target, model_output)
+            # DEBUG: Check loss before division
+            # if latents.device.index == 0:
+            #     print(f"[DEBUG] mse_loss: {mse_loss:.6f}, t[:flow_batch_size] min: {t[:flow_batch_size].min():.6f}")
+            # Add clamp to prevent division by zero
+            t_clamped = torch.clamp(t[:flow_batch_size], min=1e-6)
+            flow_loss = (mse_loss / t_clamped).mean()
         else:  # 'x1' mode
             # Direct position prediction mode
             flow_target = latents[:flow_batch_size]
-            flow_loss = (F.mse_loss(flow_target, model_output) / t[:flow_batch_size]).mean()
+            mse_loss = F.mse_loss(flow_target, model_output)
+            # DEBUG: Check loss before division
+            # if latents.device.index == 0:
+            #     print(f"[DEBUG] mse_loss: {mse_loss:.6f}, t[:flow_batch_size] min: {t[:flow_batch_size].min():.6f}")
+            # Add clamp to prevent division by zero
+            t_clamped = torch.clamp(t[:flow_batch_size], min=1e-6)
+            flow_loss = (mse_loss / t_clamped).mean()
+
+        # DEBUG: Check flow_loss for NaN
+        # if latents.device.index == 0:
+        #     print(f"[DEBUG] flow_loss: {flow_loss:.6f}, is_nan: {torch.isnan(flow_loss).any().item()}")
 
         losses["flow_loss"] = flow_loss
 
@@ -449,7 +563,17 @@ class GestureLSM(torch.nn.Module):
         consistency_loss = F.mse_loss(speed_pred, speed_target, reduction="mean")
         losses["consistency_loss"] = consistency_loss
 
-        losses["loss"] = sum(losses.values())
+        # DEBUG: Check consistency_loss for NaN
+        # if latents.device.index == 0:
+        #     print(f"[DEBUG] consistency_loss: {consistency_loss:.6f}, is_nan: {torch.isnan(consistency_loss).any().item()}")
+
+        total_loss = sum(losses.values())
+        losses["loss"] = total_loss
+
+        # DEBUG: Check total loss for NaN
+        # if latents.device.index == 0:
+        #     print(f"[DEBUG] total_loss: {total_loss:.6f}, is_nan: {torch.isnan(total_loss).any().item()}")
+
         return losses
     
 

@@ -109,8 +109,13 @@ class CustomTrainer(BaseTrainer):
             logger.info(f"Creating model {cfg.model.g_name} on GPU {self.rank}...")
             self.model = getattr(model_module, cfg.model.g_name)(cfg).to(self.rank)
             logger.info(f"Model created on GPU {self.rank}, synchronizing all processes...")
+            
+            # Synchronize all processes
+            if self.rank == 0:
+                logger.info("Rank 0: Waiting for all ranks to create model...")
             torch.distributed.barrier()
             logger.info(f"All processes synchronized after model creation on GPU {self.rank}")
+            
             logger.info(f"Creating process group on GPU {self.rank}...")
             process_group = torch.distributed.new_group()
             logger.info(f"Process group created on GPU {self.rank}, converting to SyncBatchNorm...")
@@ -118,8 +123,12 @@ class CustomTrainer(BaseTrainer):
                 self.model, process_group
             )
             logger.info(f"SyncBatchNorm converted on GPU {self.rank}, synchronizing before DDP...")
+            
+            if self.rank == 0:
+                logger.info("Rank 0: Waiting for all ranks to convert SyncBatchNorm...")
             torch.distributed.barrier()
             logger.info(f"All processes synchronized, wrapping with DDP on GPU {self.rank}...")
+            
             self.model = DDP(
                 self.model,
                 device_ids=[self.rank],
@@ -128,6 +137,9 @@ class CustomTrainer(BaseTrainer):
                 find_unused_parameters=False,
             )
             logger.info(f"DDP wrapper created on GPU {self.rank}, final synchronization...")
+            
+            if self.rank == 0:
+                logger.info("Rank 0: Waiting for all ranks to create DDP wrapper...")
             torch.distributed.barrier()
             logger.info(f"All processes synchronized after DDP wrapper on GPU {self.rank}")
         else:
@@ -401,13 +413,22 @@ class CustomTrainer(BaseTrainer):
 
         in_audio_onset_tmp = None
         in_word_tmp = None
-        for i in range(0, roundt):
+        # Skip the last roundt iteration, adjust n accordingly
+        actual_rounds = roundt - 1
+        n = n - (round_l + remain)  # Adjust n to match actual generated frames
+        
+        for i in range(0, actual_rounds):
             if audio_onset is not None:
-                in_audio_onset_tmp = audio_onset[
-                    :,
-                    i * (self.cfg.data.audio_sr // self.cfg.data.pose_fps * round_l) : (i + 1) * (self.cfg.data.audio_sr // self.cfg.data.pose_fps * round_l)
-                    + self.cfg.data.audio_sr // self.cfg.data.pose_fps * self.cfg.pre_frames * vqvae_squeeze_scale,
-                ]
+                # Calculate the audio slice start and end positions
+                audio_start = i * (self.cfg.data.audio_sr // self.cfg.data.pose_fps * round_l)
+                audio_end = (i + 1) * (self.cfg.data.audio_sr // self.cfg.data.pose_fps * round_l) + self.cfg.data.audio_sr // self.cfg.data.pose_fps * self.cfg.pre_frames * vqvae_squeeze_scale
+                
+                # If audio slice exceeds boundary, adjust from the end
+                if audio_end > audio_onset.shape[1]:
+                    audio_end = audio_onset.shape[1]
+                    audio_start = max(0, audio_end - self.cfg.data.audio_sr // self.cfg.data.pose_fps * round_l - self.cfg.data.audio_sr // self.cfg.data.pose_fps * self.cfg.pre_frames * vqvae_squeeze_scale)
+                
+                in_audio_onset_tmp = audio_onset[:, audio_start:audio_end]
             if in_word is not None:
                 in_word_tmp = in_word[
                     :,
@@ -479,7 +500,7 @@ class CustomTrainer(BaseTrainer):
         rec_hands = rec_hands * self.std_hands + self.mean_hands
         rec_lower = rec_lower * self.std_lower + self.mean_lower
 
-        n = n - remain
+        # n has already been adjusted above, no need to subtract remain again
         tar_pose = tar_pose[:, :n, :]
         tar_exps = tar_exps[:, :n, :]
         tar_trans = tar_trans[:, :n, :]

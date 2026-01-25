@@ -29,7 +29,7 @@ def process_audio_data(audio_file, args, data, f_name, selected_file):
         data['audio'] = calculate_onset_amplitude_new(audio_file, args.audio_sr)
         
     elif args.audio_rep == "mfcc":
-        audio_data, _ = librosa.load(audio_file)
+        audio_data, _ = librosa.load(audio_file, sr=args.audio_sr)
         data['audio'] = librosa.feature.melspectrogram(
             y=audio_data, 
             sr=args.audio_sr, 

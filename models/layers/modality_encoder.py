@@ -77,7 +77,8 @@ class ModalityEncoder(nn.Module):
                  audio_fps=30,
                  use_exp=False,
                  target_length=256,
-                 spatial_temporal=False
+                 spatial_temporal=False,
+                 vocab_path=None
                  ):
         super().__init__()
         
@@ -89,7 +90,10 @@ class ModalityEncoder(nn.Module):
         self.WavEncoder = WavEncoder(audio_dim, audio_in=audio_in, target_length=target_length)
         self.text_encoder_body = nn.Linear(300, audio_dim) 
 
-        with open(f"{data_path}weights/vocab.pkl", 'rb') as f:
+        # Use provided vocab_path or default to data_path/weights/vocab.pkl
+        if vocab_path is None:
+            vocab_path = f"{data_path}weights/vocab.pkl"
+        with open(vocab_path, 'rb') as f:
             self.lang_model = pickle.load(f)
             pre_trained_embedding = self.lang_model.word_embedding_weights
         self.text_pre_encoder_body = nn.Embedding.from_pretrained(torch.FloatTensor(pre_trained_embedding),freeze=t_fix_pre)
@@ -115,7 +119,9 @@ class ModalityEncoder(nn.Module):
         # Initial features extraction - single transpose each
         # [B, T, D] -> [T, B, D]
         audio_feat = self.WavEncoder(audio)
-        text_feat = self.text_encoder_body(self.text_pre_encoder_body(word))
+        # Clamp word indices to valid vocabulary range
+        word_clamped = torch.clamp(word, 0, self.text_pre_encoder_body.num_embeddings - 1)
+        text_feat = self.text_encoder_body(self.text_pre_encoder_body(word_clamped))
         if raw_audio is not None and self.raw_audio:
             # Keep the same transpose pattern for consistency
             # raw_feat = self.extract_wavlm_feats(raw_audio)

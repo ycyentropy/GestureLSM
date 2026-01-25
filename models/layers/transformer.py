@@ -173,6 +173,7 @@ class CrossAttention(nn.Module):
             attn_drop=0.,
             proj_drop=0.,
             norm_layer=nn.LayerNorm,
+            context_dim=None,
     ):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -184,13 +185,19 @@ class CrossAttention(nn.Module):
 
         # Instead of a combined QKV projection, we have separate Q and KV projections
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        
+        # We'll use a dynamic projection layer that can handle any context dimension
+        self.context_proj = None
+        self.context_dim = context_dim
         
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        
+        # KV projection will be created dynamically in forward pass if needed
+        self.kv = None
 
     def set_force_no_fused_attn(self, force_no_fused: bool):
         """Temporarily force disable fused attention for forward AD compatibility."""
@@ -203,10 +210,18 @@ class CrossAttention(nn.Module):
             context: Key/Value input of shape (B, M, C)
         """
         B, N, C = x.shape
-        M = context.shape[1]
+        M, context_dim = context.shape[1], context.shape[2]
 
         # Project queries from x
         q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        # Check if context dimension matches expected dimension
+        # If not, create a dynamic projection layer
+        if self.context_dim is None or context_dim != self.context_dim or self.kv is None:
+            # Update context_dim and recreate kv projection
+            self.context_dim = context_dim
+            # Create a new KV projection layer that matches the actual context dimension
+            self.kv = nn.Linear(self.context_dim, C * 2, bias=False).to(x.device)
         
         # Project keys and values from context
         kv = self.kv(context).reshape(B, M, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -344,6 +359,7 @@ class CrossAttentionBlock(nn.Module):
             act_layer=nn.GELU,
             norm_layer=nn.LayerNorm,
             mlp_layer=Mlp,
+            context_dim=None,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -356,6 +372,7 @@ class CrossAttentionBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             norm_layer=norm_layer,
+            context_dim=context_dim,
         )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()

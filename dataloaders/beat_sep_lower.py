@@ -132,8 +132,11 @@ class CustomDataset(Dataset):
         # In DDP mode, ensure all processes wait for cache building to complete
         if build_cache and torch.distributed.is_available() and torch.distributed.is_initialized():
             try:
+                logger.info(f"Rank {self.rank}: Waiting for cache building (rank 0)...")
                 torch.distributed.barrier()
-            except Exception:
+                logger.info(f"Rank {self.rank}: Cache building barrier passed")
+            except Exception as e:
+                logger.warning(f"Rank {self.rank}: Cache building barrier failed: {e}")
                 pass  # Silently ignore barrier failures - training can continue
         
         # Try to regenerate cache if corrupted (only on rank 0 to avoid race conditions)
@@ -143,8 +146,11 @@ class CustomDataset(Dataset):
         # Wait for cache regeneration to complete
         if build_cache and torch.distributed.is_available() and torch.distributed.is_initialized():
             try:
+                logger.info(f"Rank {self.rank}: Waiting for cache regeneration (rank 0)...")
                 torch.distributed.barrier()
-            except Exception:
+                logger.info(f"Rank {self.rank}: Cache regeneration barrier passed")
+            except Exception as e:
+                logger.warning(f"Rank {self.rank}: Cache regeneration barrier failed: {e}")
                 pass  # Silently ignore barrier failures - training can continue
         
         self.load_db_mapping()
@@ -252,11 +258,20 @@ class CustomDataset(Dataset):
             
         data.update(motion_data)
         
+        # Ensure shape and facial data use proper placeholders if missing
+        if data['shape'] is None or (data['shape'].size == 1 and data['shape'][0] == -1):
+            data['shape'] = np.array([-1])
+        
+        if data['facial'] is None or (data['facial'].size == 1 and data['facial'][0] == -1):
+            data['facial'] = np.array([-1])
+        
         # Process speaker ID
         if self.args.id_rep is not None:
             speaker_id = int(f_name.split("_")[0]) - 1
-            data['vid'] = np.repeat(np.array(speaker_id).reshape(1, 1), data['pose'].shape[0], axis=0)
+            # Save integer ID directly, no one-hot encoding, shape: (1,)
+            data['vid'] = np.array([speaker_id]) #data['vid'] = np.repeat(np.array(speaker_id).reshape(1, 1), data['pose'].shape[0], axis=0)
         else:
+            # No ID representation specified, use -1 as placeholder
             data['vid'] = np.array([-1])
         
         # Process audio if needed
@@ -393,23 +408,54 @@ class CustomDataset(Dataset):
             'word': torch.from_numpy(in_word).int()
         }
         
+        # Handle facial tensor (use zeros if placeholder)
+        if in_facial.size == 0 or (in_facial.size == 1 and in_facial[0] == -1):
+            # Create a placeholder tensor with shape (tar_pose.shape[0], 100)
+            facial_tensor = torch.zeros((tar_pose.shape[0], 100), dtype=torch.float32)
+        else:
+            facial_tensor = torch.from_numpy(in_facial).reshape((in_facial.shape[0], -1)).float()
+        
+        # Handle shape tensor (use zeros if placeholder)
+        if in_shape.size == 0 or (in_shape.size == 1 and in_shape[0] == -1):
+            # Create a placeholder tensor with shape (tar_pose.shape[0], 300)
+            shape_tensor = torch.zeros((tar_pose.shape[0], 300), dtype=torch.float32)
+        else:
+            shape_tensor = torch.from_numpy(in_shape).reshape((in_shape.shape[0], -1)).float()
+        
+        # Handle ID tensor (expand to sequence length if needed)
+        if vid.size == 0:
+            # Create a placeholder tensor with integer ID 0
+            id_tensor = torch.zeros((tar_pose.shape[0],), dtype=torch.long)
+        elif vid.size == 1 and vid[0] == -1:
+            # Handle placeholder [-1] - use 0 as general speaker
+            id_tensor = torch.zeros((tar_pose.shape[0],), dtype=torch.long)
+        elif len(vid.shape) == 1:
+            # Single integer ID, expand to sequence length
+            id_tensor = torch.full((tar_pose.shape[0],), int(vid[0]), dtype=torch.long)
+        else:
+            # Multiple IDs, use directly as sequence
+            id_tensor = torch.from_numpy(vid).long()
+            # If sequence length doesn't match, repeat or truncate
+            if id_tensor.shape[0] != tar_pose.shape[0]:
+                id_tensor = id_tensor.repeat(tar_pose.shape[0])[:tar_pose.shape[0]]
+        
         if self.loader_type == "test":
             data.update({
                 'pose': torch.from_numpy(tar_pose).float(),
                 'trans': torch.from_numpy(trans).float(),
                 'trans_v': torch.from_numpy(trans_v).float(),
-                'facial': torch.from_numpy(in_facial).float(),
-                'id': torch.from_numpy(vid).float(),
-                'beta': torch.from_numpy(in_shape).float()
+                'facial': facial_tensor,
+                'id': id_tensor,
+                'beta': shape_tensor
             })
         else:
             data.update({
                 'pose': torch.from_numpy(tar_pose).reshape((tar_pose.shape[0], -1)).float(),
                 'trans': torch.from_numpy(trans).reshape((trans.shape[0], -1)).float(),
                 'trans_v': torch.from_numpy(trans_v).reshape((trans_v.shape[0], -1)).float(),
-                'facial': torch.from_numpy(in_facial).reshape((in_facial.shape[0], -1)).float(),
-                'id': torch.from_numpy(vid).reshape((vid.shape[0], -1)).float(),
-                'beta': torch.from_numpy(in_shape).reshape((in_shape.shape[0], -1)).float()
+                'facial': facial_tensor,
+                'id': id_tensor,
+                'beta': shape_tensor
             })
         
         return data
