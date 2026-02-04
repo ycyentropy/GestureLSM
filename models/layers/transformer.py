@@ -507,3 +507,95 @@ class SpatialTemporalBlock(nn.Module):
 
         x = x + self.drop_path3(self.ls3(self.mlp(self.norm3(x))))
         return x
+
+
+class BidirectionalCrossAttention(nn.Module):
+    """
+    双向交叉注意力模块，用于Speaker和Listener动作序列的直接交互
+    
+    支持两种融合策略:
+    - "add": 将交叉注意力输出加到原特征上
+    - "concat": 拼接后通过线性层融合
+    """
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        mlp_ratio=4.,
+        qkv_bias=False,
+        qk_norm=False,
+        proj_drop=0.,
+        attn_drop=0.,
+        drop_path=0.,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+        fusion="add",  # "add" or "concat"
+    ):
+        super().__init__()
+        self.dim = dim
+        self.fusion = fusion
+        
+        # Speaker -> Listener 交叉注意力
+        self.sp_to_ls_attn = CrossAttentionBlock(
+            dim=dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            proj_drop=proj_drop,
+            attn_drop=attn_drop,
+            drop_path=drop_path,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+            context_dim=dim,  # 相同维度
+        )
+        
+        # Listener -> Speaker 交叉注意力
+        self.ls_to_sp_attn = CrossAttentionBlock(
+            dim=dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            proj_drop=proj_drop,
+            attn_drop=attn_drop,
+            drop_path=drop_path,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+            context_dim=dim,
+        )
+        
+        # 如果使用concat融合，需要额外的投影层
+        if fusion == "concat":
+            self.fusion_proj = nn.Sequential(
+                nn.Linear(dim * 2, dim),
+                norm_layer(dim),
+                act_layer(),
+                nn.Dropout(proj_drop),
+            )
+    
+    def forward(self, sp_feat, ls_feat):
+        """
+        Args:
+            sp_feat: Speaker特征 [B, N, D]
+            ls_feat: Listener特征 [B, N, D]
+        
+        Returns:
+            sp_out: 交互后的Speaker特征 [B, N, D]
+            ls_out: 交互后的Listener特征 [B, N, D]
+        """
+        # Speaker attend to Listener
+        sp_out = self.sp_to_ls_attn(sp_feat, ls_feat)
+        
+        # Listener attend to Speaker
+        ls_out = self.ls_to_sp_attn(ls_feat, sp_feat)
+        
+        if self.fusion == "concat":
+            # 拼接并投影
+            sp_out = self.fusion_proj(torch.cat([sp_feat, sp_out], dim=-1))
+            ls_out = self.fusion_proj(torch.cat([ls_feat, ls_out], dim=-1))
+        else:
+            # add融合：残差连接已在CrossAttentionBlock中处理
+            pass
+        
+        return sp_out, ls_out

@@ -1,0 +1,235 @@
+# 双向生成的Dyadic GestureLSM配置
+# 同时生成Speaker和Listener的手势
+
+experiment_name: "bidirectional_dyadic_seamless"
+
+# 归一化文件路径 (根级别，供训练器直接访问)
+mean_pose_path: "mean_std_seamless/seamless_2_330_mean.npy"
+std_pose_path: "mean_std_seamless/seamless_2_330_std.npy"
+mean_trans_path: "mean_std_seamless/seamless_2_trans_mean.npy"
+std_trans_path: "mean_std_seamless/seamless_2_trans_std.npy"
+
+# VQ-VAE缩放因子 (根级别，供训练器直接访问)
+vqvae_latent_scale: 5
+
+# ==================== 滑动窗口推理配置 ====================
+pre_frames: 4              # latent空间的种子帧数（对应姿态空间16帧）
+inference_window_size: 36   # latent空间的生成窗口大小（对应姿态空间144帧）
+vqvae_squeeze_scale: 4      # VQ编码下采样倍数
+
+# ==================== 模型配置 ====================
+model:
+  model_name: "BidirectionalDyadicLSM"
+  
+  # 时间窗口参数
+  # window_size: 18      # w: 短期窗口长度
+  horizon: 144         # h: 长期窗口长度(生成目标长度)
+  
+  # 维度设置(保持与原有LSM兼容)
+  input_dim: 384       # VQ latent维度 (128*3)
+  context_dim: 256     # 条件特征维度
+  id_embedding_dim: 256
+  max_id: 1000         # 最大ID数量
+  
+  # 损失函数配置
+  loss_type: "huber"     # "mse" 或 "huber"
+  flow_mode: "v"       # "v" (velocity) 或 "x1" (direct)
+  
+  # ★ ID信息开关参数
+  use_id: false             # 是否使用ID信息
+  main_id_weight: 0.6       # Main角色ID权重
+  int_id_weight: 0.4        # Interlocutor角色ID权重
+  
+  # CFG配置
+  do_classifier_free_guidance: true
+  guidance_scale: 2.0
+  n_steps: 2
+  
+  # Denoiser配置
+  denoiser:
+    target: models.denoiser.GestureDenoiser
+    params:
+      input_dim: 128
+      latent_dim: 256
+      ff_size: 1024
+      num_layers: 8
+      num_heads: 4
+      dropout: 0.1
+      activation: "gelu"
+      # n_seed: 8  # 种子帧数（时间维度），输出 [B, n_seed, 384]
+      seq_len: 36  # VQ encoder下采样4倍: 144/4=36
+      embed_context_multiplier: 1  # seed维度: n_seed*384, 不需要乘数
+      use_id: false
+      id_embedding_dim: 256
+      cond_proj_dim: 256  # 用于consistency loss的时间条件投影
+      # ★ 双向交叉注意力配置（用于双人交互）
+      use_bidirectional_attn: true   # 启用Speaker-Listener双向交叉注意力
+      bidirectional_layers: 2        # 双向交叉注意力层数
+      bidirectional_fusion: "add"    # 融合策略: add 或 concat
+      
+  # Modality Encoder配置
+  modality_encoder:
+    target: models.layers.modality_encoder.ModalityEncoder
+    params:
+      data_path: "datasets/seamless_interaction"
+      t_fix_pre: 4
+      audio_dim: 768
+      audio_in: ${data.audio_in}
+      raw_audio: false
+      latent_dim: 256
+      audio_fps: 30
+      use_exp: false
+      target_length: ${data.horizon}  # 与horizon保持一致
+      spatial_temporal: true
+      vocab_path: "datasets/unified_vocab.pkl"
+
+# ==================== 数据配置 ====================
+data:
+  pose_dims: 825
+  pose_fps: 30
+  audio_fps: 30
+  audio_sr: 48000
+  audio_rep: "mfcc"  # 音频特征类型: mfcc, onset+amplitude
+  audio_in: 128  # MFCC输入维度
+  audio_norm: false
+  pose_norm: true
+  use_trans: false
+  
+  # SMPLX模型路径
+  data_path_1: "./datasets/hub/"
+  
+  # 数据集路径
+  train_data_path: "datasets/seamless_interaction/improvised/train"
+  val_data_path: "datasets/seamless_interaction/improvised/val"
+  
+  # 归一化文件路径
+  mean_pose_path: "mean_std_seamless/seamless_2_330_mean.npy"
+  std_pose_path: "mean_std_seamless/seamless_2_330_std.npy"
+  mean_trans_path: "mean_std_seamless/seamless_2_trans_mean.npy"
+  std_trans_path: "mean_std_seamless/seamless_2_trans_std.npy"
+  
+  # 词汇表路径
+  vocab_path: "datasets/seamless_interaction/vocab.pkl"
+  
+  # 时间窗口参数
+  # window_size: 18
+  horizon: 144
+  stride: 60
+  min_speak_duration: 5.0  # 判定Speaker的最小说话时长(秒)
+
+  # LMDB缓存配置
+  use_lmdb: true           # ★ 启用LMDB缓存
+  cache_dir: "cache/bidirectional_dyadic"  # 缓存目录
+  new_cache: false    # ★ 重新构建缓存以包含audio_name字段
+  
+  # ★ 数据过滤配置
+  training_speakers: null   # 指定训练说话人ID列表，如 [1, 2, 3]，null表示使用所有
+  disable_filtering: false  # 是否禁用所有过滤
+  clean_first_seconds: 0    # 清理开头的秒数
+  clean_final_seconds: 0    # 清理结尾的秒数
+  skip_segmentation: false  # 是否跳过分段
+
+dataset:
+  train:
+    target: dataloaders.bidirectional_dyadic_dataset.BidirectionalDyadicDataset
+    params:
+      data_path: ${data.train_data_path}
+      window_size: ${data.window_size}
+      horizon: ${data.horizon}
+      stride: ${data.stride}
+      min_speak_duration: ${data.min_speak_duration}
+      pose_fps: ${data.pose_fps}
+      audio_fps: ${data.audio_fps}
+      audio_norm: ${data.audio_norm}
+      pose_norm: ${data.pose_norm}
+      mean_pose_path: ${data.mean_pose_path}
+      std_pose_path: ${data.std_pose_path}
+      use_lmdb: ${data.use_lmdb}
+      cache_dir: ${data.cache_dir}
+      new_cache: ${data.new_cache}
+      training_speakers: ${data.training_speakers}
+      disable_filtering: ${data.disable_filtering}
+      clean_first_seconds: ${data.clean_first_seconds}
+      clean_final_seconds: ${data.clean_final_seconds}
+      skip_segmentation: ${data.skip_segmentation}
+      vocab_path: ${model.modality_encoder.params.vocab_path}
+      audio_rep: ${data.audio_rep}
+      audio_sr: ${data.audio_sr}
+      
+  val:
+    target: dataloaders.bidirectional_dyadic_dataset.BidirectionalDyadicDataset
+    params:
+      data_path: ${data.val_data_path}
+      window_size: ${data.window_size}
+      horizon: ${data.horizon}
+      stride: ${data.stride}
+      min_speak_duration: ${data.min_speak_duration}
+      pose_fps: ${data.pose_fps}
+      audio_fps: ${data.audio_fps}
+      audio_norm: ${data.audio_norm}
+      pose_norm: ${data.pose_norm}
+      mean_pose_path: ${data.mean_pose_path}
+      std_pose_path: ${data.std_pose_path}
+      use_lmdb: ${data.use_lmdb}
+      cache_dir: ${data.cache_dir}
+      new_cache: ${data.new_cache}
+      training_speakers: ${data.training_speakers}
+      disable_filtering: ${data.disable_filtering}
+      clean_first_seconds: ${data.clean_first_seconds}
+      clean_final_seconds: ${data.clean_final_seconds}
+      skip_segmentation: ${data.skip_segmentation}
+      vocab_path: ${model.modality_encoder.params.vocab_path}
+      audio_rep: ${data.audio_rep}
+      audio_sr: ${data.audio_sr}
+
+# ==================== VQ-VAE配置 ====================
+vqvae_upper_path: "ckpt/net_seamless_64frame_4096batch_128dim_1024code_upper_best.pth"
+vqvae_hands_path: "ckpt/net_seamless_64frame_4096batch_128dim_1024code_hands_best.pth"
+vqvae_lower_path: "ckpt/net_seamless_64frame_4096batch_128dim_1024code_lower_best.pth"
+
+# ==================== 训练配置 ====================
+trainer:
+  batch_size: 128
+  val_batch_size: 64  # 验证时的batch size
+  num_workers: 4
+  max_epochs: 1000
+  
+  # 验证配置
+  max_val_iterations: 10  # 验证时的最大迭代次数，null表示验证所有数据
+  
+  # 优化器配置
+  lr: 1.0e-5
+  weight_decay: 1.0e-5
+  grad_norm: 5.0 #0.5
+  
+  # 学习率调度
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  
+  # 保存和日志
+  save_interval: 10
+  log_interval: 1
+  val_interval: 5  # 验证间隔
+
+  # 混合精度训练
+  use_amp: true
+
+  # 早停机制配置
+  early_stopping_patience: 10  # 早停耐心值
+  early_stopping_min_delta: 0.001  # 早停最小改进阈值
+
+  # ★ 梯度更新模式配置
+  separate_gradient_update: true  # 是否分开更新Speaker和Listener的梯度
+  gradient_update_mode: "separate_optimizers"  # "alternate" (交替更新) 或 "separate_optimizers" (独立优化器)
+
+# ==================== 评估配置 ====================
+evaluation:
+  metrics: ["fid", "div", "bc", "l1div"]
+  eval_interval: 10
+  num_samples: 100
+
+# ==================== 推理配置 ====================
+inference:
+  num_steps: 2 #50
+  guidance_scale: 2.0
+  use_cfg: true
