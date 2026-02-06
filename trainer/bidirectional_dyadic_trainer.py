@@ -75,45 +75,19 @@ class BidirectionalDyadicTrainer:
         self.separate_gradient_update = cfg.trainer.get('separate_gradient_update', False)
         self.gradient_update_mode = cfg.trainer.get('gradient_update_mode', 'alternate')  # 'alternate' 或 'separate_optimizers'
 
-        if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-            # 为Speaker和Listener分别创建优化器
-            # 获取共享参数（denoiser和modality_encoder）
-            # [修改] 去掉输出头，与单人模型保持一致
-            shared_params = list(model.denoiser.parameters()) + list(model.modality_encoder.parameters())
-            if model.use_id:
-                shared_params += list(model.id_embeddings.parameters())
-            
-            # Speaker和Listener使用相同的共享参数（去掉输出头）
-            speaker_params = shared_params
-            listener_params = shared_params
-            
-            # Speaker优化器
-            self.speaker_optimizer = AdamW(
-                speaker_params,
-                lr=cfg.trainer.lr,
-                weight_decay=cfg.trainer.weight_decay
-            )
+        # 使用单一优化器（所有参数共享，无需分离优化器）
+        self.optimizer = AdamW(
+            model.parameters(),
+            lr=cfg.trainer.lr,
+            weight_decay=cfg.trainer.weight_decay
+        )
+        self.speaker_optimizer = None
+        self.listener_optimizer = None
+        logger.info("Using single optimizer for bidirectional training")
 
-            # Listener优化器
-            self.listener_optimizer = AdamW(
-                listener_params,
-                lr=cfg.trainer.lr,
-                weight_decay=cfg.trainer.weight_decay
-            )
-
-            self.optimizer = None  # 不使用统一优化器
-            logger.info("Using separate optimizers for Speaker and Listener")
-        else:
-            # 统一优化器（联合训练或交替更新模式）
-            self.optimizer = AdamW(
-                model.parameters(),
-                lr=cfg.trainer.lr,
-                weight_decay=cfg.trainer.weight_decay
-            )
-            self.speaker_optimizer = None
-            self.listener_optimizer = None
-            if self.separate_gradient_update:
-                logger.info(f"Using alternate gradient update mode")
+        # 损失权重
+        self.loss_alpha = cfg.model.get('loss_alpha', 0.5)
+        logger.info(f"Loss weights - Speaker: {self.loss_alpha:.2f}, Listener: {1-self.loss_alpha:.2f}")
 
         # 训练参数
         self.max_epochs = cfg.trainer.max_epochs
@@ -164,44 +138,20 @@ class BidirectionalDyadicTrainer:
         from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 
         if self.lr_scheduler_type == 'cosine':
-            if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-                # 为两个优化器分别创建调度器
-                self.speaker_scheduler = CosineAnnealingLR(
-                    self.speaker_optimizer,
-                    T_max=self.max_epochs,
-                    eta_min=1e-6
-                )
-                self.listener_scheduler = CosineAnnealingLR(
-                    self.listener_optimizer,
-                    T_max=self.max_epochs,
-                    eta_min=1e-6
-                )
-                logger.info("Using cosine LR scheduler for both optimizers")
-            else:
-                # 统一优化器
-                self.scheduler = CosineAnnealingLR(
-                    self.optimizer,
-                    T_max=self.max_epochs,
-                    eta_min=1e-6
-                )
-                logger.info("Using cosine LR scheduler")
+            # 使用单一调度器
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.max_epochs,
+                eta_min=1e-6
+            )
+            logger.info("Using cosine LR scheduler")
         elif self.lr_scheduler_type == 'step':
-            if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-                self.speaker_scheduler = LambdaLR(
-                    self.speaker_optimizer,
-                    lr_lambda=lambda epoch: 1.0 if epoch < self.max_epochs // 2 else 0.1
-                )
-                self.listener_scheduler = LambdaLR(
-                    self.listener_optimizer,
-                    lr_lambda=lambda epoch: 1.0 if epoch < self.max_epochs // 2 else 0.1
-                )
-                logger.info("Using step LR scheduler for both optimizers")
-            else:
-                self.scheduler = LambdaLR(
-                    self.optimizer,
-                    lr_lambda=lambda epoch: 1.0 if epoch < self.max_epochs // 2 else 0.1
-                )
-                logger.info("Using step LR scheduler")
+            # 使用单一调度器
+            self.scheduler = LambdaLR(
+                self.optimizer,
+                lr_lambda=lambda epoch: 1.0 if epoch < self.max_epochs // 2 else 0.1
+            )
+            logger.info("Using step LR scheduler")
         else:
             logger.warning(f"Unknown LR scheduler type: {self.lr_scheduler_type}, using constant LR")
             self.scheduler = None
@@ -210,17 +160,8 @@ class BidirectionalDyadicTrainer:
 
     def _step_lr_schedulers(self):
         """更新学习率调度器"""
-        if self.lr_scheduler_type == 'cosine':
-            if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-                self.speaker_scheduler.step()
-                self.listener_scheduler.step()
-            elif hasattr(self, 'scheduler'):
-                self.scheduler.step()
-        elif self.lr_scheduler_type == 'step':
-            if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-                self.speaker_scheduler.step()
-                self.listener_scheduler.step()
-            elif hasattr(self, 'scheduler'):
+        if self.lr_scheduler_type == 'cosine' or self.lr_scheduler_type == 'step':
+            if hasattr(self, 'scheduler') and self.scheduler is not None:
                 self.scheduler.step()
 
     def _init_vqvae_models(self):
@@ -714,23 +655,10 @@ class BidirectionalDyadicTrainer:
             speaker_latent = self.pose_to_latent(speaker_target)
             listener_latent = self.pose_to_latent(listener_target)
 
-            # 根据梯度更新模式选择训练方式
-            if self.separate_gradient_update:
-                if self.gradient_update_mode == 'separate_optimizers':
-                    # 独立优化器模式：分别更新Speaker和Listener
-                    loss, spk_loss, lst_loss = self._train_step_separate_optimizers(
-                        speaker_input, listener_input, speaker_latent, listener_latent
-                    )
-                else:
-                    # 交替更新模式
-                    loss, spk_loss, lst_loss = self._train_step_alternate(
-                        speaker_input, listener_input, speaker_latent, listener_latent, i
-                    )
-            else:
-                # 联合训练模式
-                loss, spk_loss, lst_loss = self._train_step_joint(
-                    speaker_input, listener_input, speaker_latent, listener_latent
-                )
+            # 使用联合训练模式（单一优化器）
+            loss, spk_loss, lst_loss = self._train_step_joint(
+                speaker_input, listener_input, speaker_latent, listener_latent
+            )
 
             # 检查NaN
             if torch.isnan(torch.tensor(loss)):
@@ -770,12 +698,8 @@ class BidirectionalDyadicTrainer:
         self._step_lr_schedulers()
 
         # 打印当前学习率
-        if self.lr_scheduler_type == 'cosine':
-            if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-                lr_spk = self.speaker_optimizer.param_groups[0]['lr']
-                lr_lst = self.listener_optimizer.param_groups[0]['lr']
-                logger.info(f"Learning Rate - Speaker: {lr_spk:.2e}, Listener: {lr_lst:.2e}")
-            elif hasattr(self, 'scheduler'):
+        if self.lr_scheduler_type == 'cosine' or self.lr_scheduler_type == 'step':
+            if hasattr(self, 'scheduler') and self.scheduler is not None:
                 lr = self.optimizer.param_groups[0]['lr']
                 logger.info(f"Learning Rate: {lr:.2e}")
 
@@ -790,8 +714,7 @@ class BidirectionalDyadicTrainer:
             listener_data=listener_input,
             speaker_latent=speaker_latent,
             listener_latent=listener_latent,
-            train_consistency=False,
-            separate_gradient_update=False
+            train_consistency=True
         )
 
         loss = losses['loss']
@@ -802,97 +725,10 @@ class BidirectionalDyadicTrainer:
 
         self.optimizer.step()
 
-        return loss.item(), losses['speaker_flow_loss'].item(), losses['listener_flow_loss'].item()
+        return (loss.item(), 
+                losses['speaker_flow_loss'].item(), 
+                losses['listener_flow_loss'].item())
 
-    def _train_step_alternate(self, speaker_input, listener_input, speaker_latent, listener_latent, batch_idx):
-        """交替更新模式：交替更新Speaker和Listener"""
-        # 根据batch索引决定更新哪个角色
-        update_speaker = (batch_idx % 2 == 0)
-
-        self.optimizer.zero_grad()
-
-        # 前向传播，但只计算指定角色的损失
-        losses = self.model.train_forward(
-            speaker_data=speaker_input,
-            listener_data=listener_input,
-            speaker_latent=speaker_latent,
-            listener_latent=listener_latent,
-            train_consistency=False,
-            separate_gradient_update=True,
-            update_role='speaker' if update_speaker else 'listener'
-        )
-
-        # 只使用对应角色的损失进行反向传播
-        loss = losses['loss']
-        loss.backward()
-
-        if self.grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-
-        self.optimizer.step()
-
-        # 返回两个角色的实际损失值（用于记录），即使只更新了一个角色
-        # 注意：虽然只反向传播了一个角色的损失，但两个角色的损失都应该被记录
-        spk_loss = losses['speaker_flow_loss'].item()
-        lst_loss = losses['listener_flow_loss'].item()
-
-        if update_speaker:
-            # 更新了Speaker，返回speaker_loss作为总损失
-            return (spk_loss, spk_loss, lst_loss)
-        else:
-            # 更新了Listener，返回listener_loss作为总损失
-            return (lst_loss, spk_loss, lst_loss)
-
-    def _train_step_separate_optimizers(self, speaker_input, listener_input, speaker_latent, listener_latent):
-        """独立优化器模式：分别使用不同的优化器更新Speaker和Listener"""
-        # 1. 更新Speaker（只使用Speaker损失）
-        self.speaker_optimizer.zero_grad()
-
-        losses_spk = self.model.train_forward(
-            speaker_data=speaker_input,
-            listener_data=listener_input,
-            speaker_latent=speaker_latent,
-            listener_latent=listener_latent,
-            train_consistency=False,
-            separate_gradient_update=True,
-            update_role='speaker'
-        )
-
-        spk_loss = losses_spk['loss']
-        spk_loss.backward()
-
-        if self.grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-
-        self.speaker_optimizer.step()
-
-        # 2. 更新Listener（只使用Listener损失）
-        self.listener_optimizer.zero_grad()
-
-        losses_lst = self.model.train_forward(
-            speaker_data=speaker_input,
-            listener_data=listener_input,
-            speaker_latent=speaker_latent,
-            listener_latent=listener_latent,
-            train_consistency=False,
-            separate_gradient_update=True,
-            update_role='listener'
-        )
-
-        lst_loss = losses_lst['loss']
-        lst_loss.backward()
-
-        if self.grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-
-        self.listener_optimizer.step()
-
-        # 返回两个角色的损失之和（用于记录）
-        total_loss = losses_spk['speaker_flow_loss'].item() + losses_lst['listener_flow_loss'].item()
-        return (total_loss,
-                losses_spk['speaker_flow_loss'].item(),
-                losses_lst['listener_flow_loss'].item())
-    
     @torch.no_grad()
     def validate(self, epoch):
         """
@@ -1003,13 +839,40 @@ class BidirectionalDyadicTrainer:
                     speaker_seed_tmp = last_speaker_pred[:, -pre_frames_latent:, :]
                     listener_seed_tmp = last_listener_pred[:, -pre_frames_latent:, :]
                 
+                # ★★★ 关键修改：获取当前窗口对应的音频和文本 ★★★
+                # 计算当前窗口在姿态空间中的起始位置
+                window_start_pose = i * effective_generation * self.cfg.vqvae_squeeze_scale
+                window_end_pose = window_start_pose + horizon
+                
+                # 获取当前窗口的音频和文本（随滑动窗口移动）
+                audio_start = window_start_pose
+                audio_end = min(window_start_pose + horizon, len(speaker_audio_full))
+                
+                speaker_audio_window = speaker_audio_full[audio_start:audio_end]
+                speaker_word_window = speaker_word_full[audio_start:audio_end]
+                
+                # 如果长度不足，进行填充（保持与原框架一致）
+                if len(speaker_audio_window) < horizon:
+                    pad_length = horizon - len(speaker_audio_window)
+                    # 音频填充：重复最后一帧
+                    speaker_audio_window = torch.cat([
+                        speaker_audio_window,
+                        speaker_audio_window[-1:].expand(pad_length, -1)
+                    ], dim=0)
+                    # 文本填充：使用最后一个token
+                    pad_token = speaker_word_window[-1]
+                    speaker_word_window = torch.cat([
+                        speaker_word_window,
+                        torch.full((pad_length,), pad_token, dtype=speaker_word_window.dtype, device=speaker_word_window.device)
+                    ], dim=0)
+                
                 # 准备输入数据
                 speaker_id = batch['speaker']['id'][0] if isinstance(batch['speaker']['id'], list) else batch['speaker']['id'][0:1]
                 listener_id = batch['listener']['id'][0] if isinstance(batch['listener']['id'], list) else batch['listener']['id'][0:1]
                 
                 speaker_input = {
-                    'audio': speaker_audio.unsqueeze(0),
-                    'word': speaker_word.unsqueeze(0),
+                    'audio': speaker_audio_window.unsqueeze(0),
+                    'word': speaker_word_window.unsqueeze(0),
                     'seed': speaker_seed_tmp,
                     'id': speaker_id.unsqueeze(0).expand(1, horizon),
                 }
@@ -1035,8 +898,10 @@ class BidirectionalDyadicTrainer:
                     all_listener_pred.append(listener_pred)
                 else:
                     # 拼接结果（跳过pre_frames重叠部分）
-                    all_speaker_pred.append(speaker_pred[:, pre_frames_scaled:, :])
-                    all_listener_pred.append(listener_pred[:, pre_frames_scaled:, :])
+                    # speaker_pred shape: [B, 384, 1, T]，需要在第3维（时间维度）上切片
+                    # 使用pre_frames_latent而不是pre_frames_scaled
+                    all_speaker_pred.append(speaker_pred[:, :, :, pre_frames_latent:])
+                    all_listener_pred.append(listener_pred[:, :, :, pre_frames_latent:])
                 
                 # 保存当前窗口的预测用于下一个窗口
                 last_speaker_pred = speaker_pred
@@ -1354,11 +1219,11 @@ class BidirectionalDyadicTrainer:
                 }
 
                 # 保存优化器状态
-                if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-                    best_checkpoint['speaker_optimizer_state_dict'] = self.speaker_optimizer.state_dict()
-                    best_checkpoint['listener_optimizer_state_dict'] = self.listener_optimizer.state_dict()
-                elif self.optimizer is not None:
+                if self.optimizer is not None:
                     best_checkpoint['optimizer_state_dict'] = self.optimizer.state_dict()
+                # 保存学习率调度器状态
+                if hasattr(self, 'scheduler') and self.scheduler is not None:
+                    best_checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
                 torch.save(best_checkpoint, best_path)
     
@@ -1388,19 +1253,11 @@ class BidirectionalDyadicTrainer:
         }
 
         # 保存优化器状态
-        if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-            checkpoint['speaker_optimizer_state_dict'] = self.speaker_optimizer.state_dict()
-            checkpoint['listener_optimizer_state_dict'] = self.listener_optimizer.state_dict()
-            # 保存学习率调度器状态
-            if hasattr(self, 'speaker_scheduler') and self.speaker_scheduler is not None:
-                checkpoint['speaker_scheduler_state_dict'] = self.speaker_scheduler.state_dict()
-            if hasattr(self, 'listener_scheduler') and self.listener_scheduler is not None:
-                checkpoint['listener_scheduler_state_dict'] = self.listener_scheduler.state_dict()
-        else:
+        if self.optimizer is not None:
             checkpoint['optimizer_state_dict'] = self.optimizer.state_dict()
-            # 保存学习率调度器状态
-            if hasattr(self, 'scheduler') and self.scheduler is not None:
-                checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        # 保存学习率调度器状态
+        if hasattr(self, 'scheduler') and self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
@@ -1485,22 +1342,11 @@ class BidirectionalDyadicTrainer:
         logger.info("Loaded model state dict with strict=False (ignoring missing keys)")
 
         # 加载优化器状态
-        if self.separate_gradient_update and self.gradient_update_mode == 'separate_optimizers':
-            if 'speaker_optimizer_state_dict' in checkpoint:
-                self.speaker_optimizer.load_state_dict(checkpoint['speaker_optimizer_state_dict'])
-            if 'listener_optimizer_state_dict' in checkpoint:
-                self.listener_optimizer.load_state_dict(checkpoint['listener_optimizer_state_dict'])
-            # 加载学习率调度器状态
-            if 'speaker_scheduler_state_dict' in checkpoint and hasattr(self, 'speaker_scheduler'):
-                self.speaker_scheduler.load_state_dict(checkpoint['speaker_scheduler_state_dict'])
-            if 'listener_scheduler_state_dict' in checkpoint and hasattr(self, 'listener_scheduler'):
-                self.listener_scheduler.load_state_dict(checkpoint['listener_scheduler_state_dict'])
-        else:
-            if 'optimizer_state_dict' in checkpoint and self.optimizer is not None:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            # 加载学习率调度器状态
-            if 'scheduler_state_dict' in checkpoint and hasattr(self, 'scheduler'):
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'optimizer_state_dict' in checkpoint and self.optimizer is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # 加载学习率调度器状态
+        if 'scheduler_state_dict' in checkpoint and hasattr(self, 'scheduler') and self.scheduler is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
         # 获取epoch
         epoch = checkpoint.get('epoch', 0)
@@ -1525,22 +1371,650 @@ class BidirectionalDyadicTrainer:
         # 返回下一个epoch
         return epoch + 1
 
+    def _save_test_results_npz(self, speaker_pred, listener_pred, 
+                              speaker_gt, listener_gt, 
+                              batch, results_dir, file_name):
+        """
+        保存测试结果到npz文件，格式与原框架完全一致
+        
+        保存两个文件：
+        - gt_{file_name}.npz: 真实值
+        - res_{file_name}.npz: 预测结果
+        """
+        import numpy as np
+        
+        # 转换为numpy
+        speaker_pred_np = speaker_pred.detach().cpu().numpy()  # [1, T, 165]
+        listener_pred_np = listener_pred.detach().cpu().numpy()
+        speaker_gt_np = speaker_gt.detach().cpu().numpy()  # [T, 165] 或 [1, T, 165]
+        listener_gt_np = listener_gt.detach().cpu().numpy()
+        
+        # 去掉batch维度（如果有）
+        if speaker_pred_np.ndim == 3:
+            speaker_pred_np = speaker_pred_np[0]  # [T, 165]
+        if listener_pred_np.ndim == 3:
+            listener_pred_np = listener_pred_np[0]
+        if speaker_gt_np.ndim == 3:
+            speaker_gt_np = speaker_gt_np[0]
+        if listener_gt_np.ndim == 3:
+            listener_gt_np = listener_gt_np[0]
+        
+        # 获取序列长度
+        T = speaker_pred_np.shape[0]
+        T_gt = speaker_gt_np.shape[0]
+        
+        logger.info(f"Saved sequence length: pred={T} frames, gt={T_gt} frames")
+        
+        # 尝试加载原始npz文件获取betas等信息
+        betas = np.zeros((1, 300), dtype=np.float32)
+        try:
+            metadata = batch['metadata'][0]
+            # 使用test_data_path或val_data_path或train_data_path
+            data_path = self.cfg.data.get('test_data_path') or self.cfg.data.get('val_data_path') or self.cfg.data.get('train_data_path', '')
+            original_npz_path = os.path.join(
+                data_path,
+                metadata.get('speaker_file', '')
+            )
+            if os.path.exists(original_npz_path):
+                original_npz = np.load(original_npz_path, allow_pickle=True)
+                if 'betas' in original_npz:
+                    betas = original_npz['betas']
+        except Exception as e:
+            pass
+        
+        # 创建expressions和trans（0填充）
+        expressions = np.zeros((T, 100), dtype=np.float32)
+        trans = np.zeros((T, 3), dtype=np.float32)
+        
+        # ★★★ 保存真实值 (gt_*.npz) ★★★
+        # 与原框架格式完全一致
+        gt_save_path = os.path.join(results_dir, f"gt_{file_name}.npz")
+        np.savez(
+            gt_save_path,
+            betas=betas,
+            poses=speaker_gt_np,  # 使用speaker的pose作为代表
+            expressions=expressions,
+            trans=trans,
+            model="smplx2020",
+            gender="neutral",
+            mocap_frame_rate=30,
+        )
+        
+        # ★★★ 保存预测结果 (res_*.npz) ★★★
+        # 与原框架格式完全一致
+        res_save_path = os.path.join(results_dir, f"res_{file_name}.npz")
+        np.savez(
+            res_save_path,
+            betas=betas,
+            poses=speaker_pred_np,  # 使用speaker的pose作为代表
+            expressions=expressions,
+            trans=trans,
+            model="smplx2020",
+            gender="neutral",
+            mocap_frame_rate=30,
+        )
+        
+        # 额外保存双人模型的完整结果（可选）
+        # 保存包含speaker和listener的完整信息
+        full_save_path = os.path.join(results_dir, f"full_{file_name}.npz")
+        np.savez(
+            full_save_path,
+            betas=betas,
+            speaker_poses=speaker_pred_np,
+            listener_poses=listener_pred_np,
+            speaker_gt=speaker_gt_np,
+            listener_gt=listener_gt_np,
+            expressions=expressions,
+            trans=trans,
+            model="smplx2020",
+            gender="neutral",
+            mocap_frame_rate=30,
+        )
+
+    def test(self, checkpoint_path, save_results=True, split='test'):
+        """
+        在测试集或验证集上测试模型，保存结果npz文件
+        格式与原框架完全一致：betas, poses, expressions, trans
+        
+        Args:
+            checkpoint_path: 检查点路径
+            save_results: 是否保存结果
+            split: 'test' 或 'val'，默认为'test'
+        """
+        # 1. 加载检查点
+        self.load_checkpoint(checkpoint_path)
+        logger.info(f"Loaded checkpoint from {checkpoint_path}")
+        
+        # 2. 创建数据集
+        if split == 'val':
+            logger.info("Using val dataset for testing")
+            test_dataset = self.val_dataset
+        elif 'test' not in self.cfg.dataset:
+            logger.warning("No test dataset configured, using val dataset")
+            test_dataset = self.val_dataset
+        else:
+            test_dataset = BidirectionalDyadicDataset(
+                self.cfg.dataset.test.params, 
+                split='test'
+            )
+        
+        # 导入collate_fn
+        from dataloaders.bidirectional_dyadic_dataset import collate_fn
+        
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,  # 测试时batch_size=1
+            shuffle=False,
+            num_workers=self.cfg.trainer.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True
+        )
+        
+        # 3. 创建结果保存目录
+        results_dir = os.path.join(
+            self.cfg.get('test_results_dir', 'test_results'),
+            self.cfg.experiment_name,
+            os.path.basename(checkpoint_path).replace('.pt', '')
+        )
+        os.makedirs(results_dir, exist_ok=True)
+        logger.info(f"Results will be saved to {results_dir}")
+        
+        # 4. 初始化指标存储
+        all_metrics = {
+            'speaker_fgd': [],
+            'listener_fgd': [],
+            'avg_fgd': [],
+            'speaker_l1div': [],
+            'listener_l1div': [],
+            'speaker_bc': [],
+            'listener_bc': [],
+        }
+        
+        # 5. 初始化latent累积列表（与验证时保持一致）
+        latent_out_speaker = []
+        latent_ori_speaker = []
+        latent_out_listener = []
+        latent_ori_listener = []
+        
+        # 6. 初始化筛选统计
+        total_sequences = 0
+        processed_sequences = 0
+        skipped_short = 0
+        skipped_long = 0
+        skipped_other = 0
+        
+        # 5. 测试循环
+        self.model.eval()
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(test_loader, desc="Testing")):
+                if batch is None:
+                    continue
+                
+                total_sequences += 1
+                batch = self._to_device(batch)
+                
+                # 获取文件名用于保存
+                metadata = batch['metadata'][0]
+                file_name = metadata.get('speaker_file', f'test_sample_{batch_idx}').replace('.npz', '')
+                
+                # 提取完整序列
+                speaker_pose_full = batch['speaker']['pose'][0]
+                listener_pose_full = batch['listener']['pose'][0]
+                speaker_audio_full = batch['speaker']['audio'][0]
+                speaker_word_full = batch['speaker']['word'][0]
+                
+                logger.info(f"Sequence info: pose_len={speaker_pose_full.shape[0]}, audio_len={len(speaker_audio_full)}, word_len={len(speaker_word_full)}")
+                
+                # 获取配置参数
+                horizon = self.cfg.model.horizon
+                pre_frames_scaled = self.cfg.pre_frames * self.cfg.vqvae_squeeze_scale
+                
+                # 序列长度筛选
+                seq_len = speaker_pose_full.shape[0]
+                
+                # 计算最小序列长度
+                min_seq_len = getattr(args, 'min_seq_len', None)
+                if min_seq_len is None:
+                    min_seq_len = horizon + pre_frames_scaled  # 默认最小长度
+                
+                # 计算最大序列长度
+                max_seq_len = getattr(args, 'max_seq_len', None)
+                
+                # 检查序列长度
+                if seq_len < min_seq_len:
+                    logger.warning(f"Sequence too short: {seq_len} < {min_seq_len}")
+                    skipped_short += 1
+                    continue
+                
+                if max_seq_len is not None and seq_len > max_seq_len:
+                    logger.warning(f"Sequence too long: {seq_len} > {max_seq_len}")
+                    skipped_long += 1
+                    continue
+                
+                processed_sequences += 1
+                
+                # 提取seed和target
+                speaker_seed_pose = speaker_pose_full[:pre_frames_scaled]
+                listener_seed_pose = listener_pose_full[:pre_frames_scaled]
+                # 注意：这里先保存完整的目标序列，滑动窗口结束后会根据实际生成长度调整
+                speaker_target_pose = speaker_pose_full[pre_frames_scaled:]
+                listener_target_pose = listener_pose_full[pre_frames_scaled:]
+                
+                # 编码seed为latent（与validate方法保持一致）
+                speaker_seed_latent = self.pose_to_seed_latent(speaker_seed_pose.unsqueeze(0))
+                listener_seed_latent = self.pose_to_seed_latent(listener_seed_pose.unsqueeze(0))
+                
+                # 预先编码完整target序列为latent（确保所有窗口的真值latent长度一致）
+                speaker_target_latent_full = self.pose_to_latent(speaker_target_pose.unsqueeze(0))
+                listener_target_latent_full = self.pose_to_latent(listener_target_pose.unsqueeze(0))
+                
+                # 滑动窗口推理 - 修复基于实际序列长度的计算
+                # 计算参数
+                pre_frames_latent = self.cfg.pre_frames  # 4帧latent
+                window_size_latent = self.cfg.inference_window_size  # 36帧latent（整个窗口）
+                effective_generation = window_size_latent - pre_frames_latent  # 32帧latent（有效生成部分）
+                vqvae_squeeze_scale = self.cfg.vqvae_squeeze_scale
+                
+                # 计算需要多少个窗口才能覆盖整个序列
+                # 目标是生成 speaker_target_pose 的长度
+                target_len = speaker_target_pose.shape[0]  # 姿态空间的长度
+                target_len_latent = target_len // vqvae_squeeze_scale  # latent空间的长度
+                
+                # 计算需要的窗口数：确保覆盖整个序列
+                # 需要生成的latent帧数 = target_len_latent - pre_frames_latent
+                # 每个窗口生成 effective_generation 帧latent
+                # 窗口数 = ceil((target_len_latent - pre_frames_latent) / effective_generation)
+                frames_to_generate = target_len_latent - pre_frames_latent
+                actual_rounds = (frames_to_generate + effective_generation - 1) // effective_generation
+                actual_rounds = max(1, actual_rounds)
+                
+                # 计算预期生成的总帧数
+                expected_total_frames = actual_rounds * effective_generation
+                logger.info(f"Sequence length: {seq_len}, target_len: {target_len}, target_len_latent: {target_len_latent}, frames_to_generate: {frames_to_generate}, actual_rounds: {actual_rounds}, expected_total_frames: {expected_total_frames}")
+                
+                all_speaker_pred = []
+                all_listener_pred = []
+                
+                for i in range(0, actual_rounds):
+                    # 计算当前窗口在姿态空间中的位置
+                    # 使用effective_generation而不是window_size_latent来计算滑动步长
+                    window_start_pose = i * effective_generation * vqvae_squeeze_scale
+                    window_end_pose = min(window_start_pose + window_size_latent * vqvae_squeeze_scale, target_len)
+                    
+                    # 获取当前窗口的音频（仿照原框架）
+                    # audio_start = i * round_l * vqvae_squeeze_scale
+                    # audio_end = (i + 1) * round_l * vqvae_squeeze_scale + pre_frames_scaled
+                    audio_start = window_start_pose
+                    audio_end = min(window_start_pose + horizon, len(speaker_audio_full))
+                    
+                    speaker_audio_window = speaker_audio_full[audio_start:audio_end]
+                    speaker_word_window = speaker_word_full[audio_start:audio_end]
+                    
+                    # 如果长度不足，进行填充
+                    if len(speaker_audio_window) < horizon:
+                        pad_length = horizon - len(speaker_audio_window)
+                        speaker_audio_window = torch.cat([
+                            speaker_audio_window,
+                            speaker_audio_window[-1:].expand(pad_length, -1)
+                        ], dim=0)
+                        pad_token = speaker_word_window[-1]
+                        speaker_word_window = torch.cat([
+                            speaker_word_window,
+                            torch.full((pad_length,), pad_token, dtype=speaker_word_window.dtype, device=speaker_word_window.device)
+                        ], dim=0)
+                    
+                    # 获取当前窗口的ID（仿照原框架）
+                    speaker_id = batch['speaker']['id'][0] if isinstance(batch['speaker']['id'], list) else batch['speaker']['id'][0:1]
+                    listener_id = batch['listener']['id'][0] if isinstance(batch['listener']['id'], list) else batch['listener']['id'][0:1]
+                    speaker_id_window = speaker_id.unsqueeze(0).expand(1, horizon)
+                    listener_id_window = listener_id.unsqueeze(0).expand(1, horizon)
+                    
+                    # 获取当前窗口的seed（仿照原框架）
+                    # 使用固定的4帧，因为denoiser的embed_text层输入维度是384*4=1536
+                    if i == 0:
+                        speaker_seed_tmp = speaker_seed_latent[:, :4, :]
+                        listener_seed_tmp = listener_seed_latent[:, :4, :]
+                    else:
+                        # 从预测结果中提取seed，需要调整维度
+                        # 预测结果的形状是 [B, 384, 1, T]
+                        speaker_seed_tmp = last_speaker_pred[:, :, :, -4:].squeeze(2).permute(0, 2, 1)
+                        listener_seed_tmp = last_listener_pred[:, :, :, -4:].squeeze(2).permute(0, 2, 1)
+                    
+                    # 准备输入数据
+                    speaker_input = {
+                        'audio': speaker_audio_window.unsqueeze(0),
+                        'word': speaker_word_window.unsqueeze(0),
+                        'seed': speaker_seed_tmp,
+                        'id': speaker_id_window,
+                    }
+                    listener_input = {
+                        'seed': listener_seed_tmp,
+                        'id': listener_id_window,
+                    }
+                    
+                    # 获取当前窗口的真值latent（从预先编码的完整latent中截取）
+                    # 计算当前窗口在latent空间中的位置
+                    window_start_latent = window_start_pose // vqvae_squeeze_scale
+                    window_end_latent = window_start_latent + window_size_latent
+                    
+                    # 从完整latent中截取对应窗口
+                    speaker_gt_latent = speaker_target_latent_full[:, window_start_latent:window_end_latent, :]
+                    listener_gt_latent = listener_target_latent_full[:, window_start_latent:window_end_latent, :]
+                    
+                    # 如果窗口长度不足，直接舍弃
+                    expected_latent_len = window_size_latent
+                    if speaker_gt_latent.shape[1] < expected_latent_len:
+                        logger.warning(f"Window {i}/{actual_rounds-1}: skipping due to insufficient length ({speaker_gt_latent.shape[1]} < {expected_latent_len})")
+                        continue
+                    
+                    # 生成
+                    speaker_pred, listener_pred = self.model.generate(
+                        speaker_data=speaker_input,
+                        listener_data=listener_input,
+                        speaker_gt=speaker_gt_latent,
+                        listener_gt=listener_gt_latent,
+                        mode='conditional',
+                        num_steps=self.cfg.model.get('num_inference_steps', 2),
+                        guidance_scale=self.cfg.model.get('guidance_scale', 2.0)
+                    )
+                    
+                    # 保存结果（所有窗口都需要切片，去掉pre_frames_latent重叠部分）
+                    # speaker_pred shape: [B, 384, 1, T]，T是latent空间的时间维度
+                    # 使用pre_frames_latent而不是pre_frames_scaled
+                    all_speaker_pred.append(speaker_pred[:, :, :, pre_frames_latent:])
+                    all_listener_pred.append(listener_pred[:, :, :, pre_frames_latent:])
+                    
+                    last_speaker_pred = speaker_pred
+                    last_listener_pred = listener_pred
+                
+                logger.info(f"Processed {len(all_speaker_pred)} windows out of {actual_rounds} planned")
+                
+                speaker_pred = torch.cat(all_speaker_pred, dim=3)
+                listener_pred = torch.cat(all_listener_pred, dim=3)
+                
+                logger.info(f"Concatenated speaker_pred shape: {speaker_pred.shape}, listener_pred shape: {listener_pred.shape}")
+                
+                speaker_pred_3d = speaker_pred.squeeze(2).permute(0, 2, 1)
+                listener_pred_3d = listener_pred.squeeze(2).permute(0, 2, 1)
+                speaker_pose_pred = self.latent_to_pose(speaker_pred_3d)
+                listener_pose_pred = self.latent_to_pose(listener_pred_3d)
+                
+                # 截取真值序列以匹配预测长度（允许少量误差）
+                pred_len = speaker_pose_pred.shape[1]
+                speaker_target_pose = speaker_target_pose[:pred_len]
+                listener_target_pose = listener_target_pose[:pred_len]
+                
+                # ★★★ 计算指标 ★★★
+                # FGD - 使用eval_copy计算latent（与验证时保持一致）
+                if self.eval_copy is not None:
+                    # 将姿态转换为6D旋转
+                    bs, seq = speaker_pose_pred.shape[:2]
+                    speaker_pose_6d = rc.axis_angle_to_matrix(speaker_pose_pred.reshape(bs, seq, 55, 3))
+                    speaker_pose_6d = rc.matrix_to_rotation_6d(speaker_pose_6d).reshape(bs, seq, 330)
+                    
+                    listener_pose_6d = rc.axis_angle_to_matrix(listener_pose_pred.reshape(bs, seq, 55, 3))
+                    listener_pose_6d = rc.matrix_to_rotation_6d(listener_pose_6d).reshape(bs, seq, 330)
+                    
+                    speaker_gt_6d = rc.axis_angle_to_matrix(speaker_target_pose.unsqueeze(0).reshape(bs, seq, 55, 3))
+                    speaker_gt_6d = rc.matrix_to_rotation_6d(speaker_gt_6d).reshape(bs, seq, 330)
+                    
+                    listener_gt_6d = rc.axis_angle_to_matrix(listener_target_pose.unsqueeze(0).reshape(bs, seq, 55, 3))
+                    listener_gt_6d = rc.matrix_to_rotation_6d(listener_gt_6d).reshape(bs, seq, 330)
+                    
+                    # 计算FGD：与验证时保持一致（只使用vae_test_len的整数倍帧数）
+                    vae_test_len = getattr(self.cfg, 'vae_test_len', 32)
+                    seq = speaker_pose_6d.shape[1]
+                    remain = seq % vae_test_len
+                    if seq - remain > 0:
+                        valid_len = seq - remain
+                        
+                        # 计算FGD的latent表示
+                        latent_out_sp = self.eval_copy.map2latent(speaker_pose_6d[:, :valid_len])
+                        latent_out_ls = self.eval_copy.map2latent(listener_pose_6d[:, :valid_len])
+                        latent_ori_sp = self.eval_copy.map2latent(speaker_gt_6d[:, :valid_len])
+                        latent_ori_ls = self.eval_copy.map2latent(listener_gt_6d[:, :valid_len])
+                        
+                        # reshape为[-1, vae_test_len]，与验证时保持一致
+                        latent_out_sp = latent_out_sp.reshape(-1, vae_test_len).detach().cpu().numpy()
+                        latent_out_ls = latent_out_ls.reshape(-1, vae_test_len).detach().cpu().numpy()
+                        latent_ori_sp = latent_ori_sp.reshape(-1, vae_test_len).detach().cpu().numpy()
+                        latent_ori_ls = latent_ori_ls.reshape(-1, vae_test_len).detach().cpu().numpy()
+                        
+                        # 累积latent（与验证时保持一致）
+                        latent_out_speaker.append(latent_out_sp)
+                        latent_ori_speaker.append(latent_ori_sp)
+                        latent_out_listener.append(latent_out_ls)
+                        latent_ori_listener.append(latent_ori_ls)
+                
+                # L1Div - 使用SMPLX计算关节点
+                if self.smplx is not None:
+                    bs, n = speaker_pose_pred.shape[0], speaker_pose_pred.shape[1]
+                    total_frames = bs * n
+                    
+                    # 准备SMPLX输入 - 展平为[total_frames, 165]
+                    speaker_pose_pred_flat = speaker_pose_pred.reshape(total_frames, 165).contiguous()
+                    listener_pose_pred_flat = listener_pose_pred.reshape(total_frames, 165).contiguous()
+                    speaker_gt_flat = speaker_target_pose.unsqueeze(0).reshape(total_frames, 165).contiguous()
+                    listener_gt_flat = listener_target_pose.unsqueeze(0).reshape(total_frames, 165).contiguous()
+                    
+                    # 分批处理以减少内存使用
+                    chunk_size = 512
+                    joints_speaker_pred = []
+                    joints_listener_pred = []
+                    joints_speaker_gt = []
+                    joints_listener_gt = []
+                    
+                    for i in range(0, total_frames, chunk_size):
+                        end_idx = min(i + chunk_size, total_frames)
+                        chunk_batch_size = end_idx - i
+                        
+                        # 创建SMPLX参数张量（零张量）
+                        betas = torch.zeros(chunk_batch_size, 300, device=self.device)
+                        expression = torch.zeros(chunk_batch_size, 100, device=self.device)
+                        jaw_pose = torch.zeros(chunk_batch_size, 3, device=self.device)
+                        leye_pose = torch.zeros(chunk_batch_size, 3, device=self.device)
+                        reye_pose = torch.zeros(chunk_batch_size, 3, device=self.device)
+                        
+                        with torch.no_grad():
+                            # Speaker预测
+                            output_sp = self.smplx(
+                                betas=betas,
+                                expression=expression,
+                                jaw_pose=jaw_pose,
+                                leye_pose=leye_pose,
+                                reye_pose=reye_pose,
+                                global_orient=speaker_pose_pred_flat[i:end_idx, :3],
+                                body_pose=speaker_pose_pred_flat[i:end_idx, 3:66],
+                                left_hand_pose=speaker_pose_pred_flat[i:end_idx, 75:120],
+                                right_hand_pose=speaker_pose_pred_flat[i:end_idx, 120:165],
+                                return_joints=True
+                            )
+                            # Listener预测
+                            output_ls = self.smplx(
+                                betas=betas,
+                                expression=expression,
+                                jaw_pose=jaw_pose,
+                                leye_pose=leye_pose,
+                                reye_pose=reye_pose,
+                                global_orient=listener_pose_pred_flat[i:end_idx, :3],
+                                body_pose=listener_pose_pred_flat[i:end_idx, 3:66],
+                                left_hand_pose=listener_pose_pred_flat[i:end_idx, 75:120],
+                                right_hand_pose=listener_pose_pred_flat[i:end_idx, 120:165],
+                                return_joints=True
+                            )
+                            # Speaker真值
+                            output_sp_gt = self.smplx(
+                                betas=betas,
+                                expression=expression,
+                                jaw_pose=jaw_pose,
+                                leye_pose=leye_pose,
+                                reye_pose=reye_pose,
+                                global_orient=speaker_gt_flat[i:end_idx, :3],
+                                body_pose=speaker_gt_flat[i:end_idx, 3:66],
+                                left_hand_pose=speaker_gt_flat[i:end_idx, 75:120],
+                                right_hand_pose=speaker_gt_flat[i:end_idx, 120:165],
+                                return_joints=True
+                            )
+                            # Listener真值
+                            output_ls_gt = self.smplx(
+                                betas=betas,
+                                expression=expression,
+                                jaw_pose=jaw_pose,
+                                leye_pose=leye_pose,
+                                reye_pose=reye_pose,
+                                global_orient=listener_gt_flat[i:end_idx, :3],
+                                body_pose=listener_gt_flat[i:end_idx, 3:66],
+                                left_hand_pose=listener_gt_flat[i:end_idx, 75:120],
+                                right_hand_pose=listener_gt_flat[i:end_idx, 120:165],
+                                return_joints=True
+                            )
+                        
+                        joints_speaker_pred.append(output_sp['joints'])
+                        joints_listener_pred.append(output_ls['joints'])
+                        joints_speaker_gt.append(output_sp_gt['joints'])
+                        joints_listener_gt.append(output_ls_gt['joints'])
+                    
+                    # 合并所有chunks并转换为numpy
+                    joints_speaker_pred = torch.cat(joints_speaker_pred, dim=0).detach().cpu().numpy()
+                    joints_listener_pred = torch.cat(joints_listener_pred, dim=0).detach().cpu().numpy()
+                    joints_speaker_gt = torch.cat(joints_speaker_gt, dim=0).detach().cpu().numpy()
+                    joints_listener_gt = torch.cat(joints_listener_gt, dim=0).detach().cpu().numpy()
+                    
+                    # reshape为 [bs, n, joints, 3]，只取前55个关节
+                    joints_speaker_pred = joints_speaker_pred.reshape(bs, n, -1, 3)[:, :, :55, :]
+                    joints_listener_pred = joints_listener_pred.reshape(bs, n, -1, 3)[:, :, :55, :]
+                    joints_speaker_gt = joints_speaker_gt.reshape(bs, n, -1, 3)[:, :, :55, :]
+                    joints_listener_gt = joints_listener_gt.reshape(bs, n, -1, 3)[:, :, :55, :]
+                    
+                    # 展平为 [bs, n, features]，然后取第一个batch [0]
+                    speaker_pred_flat = joints_speaker_pred.reshape(bs, n, -1)[0]  # [n, features]
+                    listener_pred_flat = joints_listener_pred.reshape(bs, n, -1)[0]
+                    speaker_gt_flat = joints_speaker_gt.reshape(bs, n, -1)[0]
+                    listener_gt_flat = joints_listener_gt.reshape(bs, n, -1)[0]
+                    
+                    # 使用.run()方法计算L1Div
+                    self.l1_calculator_speaker.run(speaker_pred_flat)
+                    self.l1_calculator_listener.run(listener_pred_flat)
+                    self.l1_calculator_speaker_gt.run(speaker_gt_flat)
+                    self.l1_calculator_listener_gt.run(listener_gt_flat)
+                
+                # BC - 在test模式中跳过BC计算
+                # 原因：test模式使用音频特征（MFCC），而BC计算需要原始音频波形
+                speaker_bc = 0.0
+                listener_bc = 0.0
+                
+                all_metrics['speaker_bc'].append(speaker_bc)
+                all_metrics['listener_bc'].append(listener_bc)
+                
+                if save_results:
+                    self._save_test_results_npz(
+                        speaker_pose_pred, listener_pose_pred,
+                        speaker_target_pose, listener_target_pose,
+                        batch, results_dir, file_name
+                    )
+            
+            # ★★★ 打印筛选统计信息 ★★★
+            logger.info("=" * 60)
+            logger.info("Sequence Filtering Summary:")
+            logger.info("=" * 60)
+            logger.info(f"Total sequences: {total_sequences}")
+            logger.info(f"Processed sequences: {processed_sequences}")
+            logger.info(f"Skipped (too short): {skipped_short}")
+            logger.info(f"Skipped (too long): {skipped_long}")
+            logger.info(f"Skipped (other): {skipped_other}")
+            logger.info(f"Processing rate: {processed_sequences}/{total_sequences} ({processed_sequences/total_sequences*100:.1f}%)")
+            logger.info("=" * 60)
+            
+            # ★★★ 计算并打印汇总指标 ★★★
+            logger.info("=" * 60)
+            logger.info("Test Results Summary:")
+            logger.info("=" * 60)
+            
+            # FGD - 与验证时保持一致（使用累积的latent计算整个测试集的FGD）
+            if len(latent_out_speaker) > 0 and len(latent_ori_speaker) > 0:
+                # 合并所有batch的latent（与验证时保持一致）
+                latent_out_sp = np.concatenate(latent_out_speaker, axis=0)
+                latent_ori_sp = np.concatenate(latent_ori_speaker, axis=0)
+                latent_out_ls = np.concatenate(latent_out_listener, axis=0)
+                latent_ori_ls = np.concatenate(latent_ori_listener, axis=0)
+                
+                # 计算整个测试集的FGD（与验证时保持一致）
+                speaker_fgd = data_tools.FIDCalculator.frechet_distance(latent_out_sp, latent_ori_sp)
+                listener_fgd = data_tools.FIDCalculator.frechet_distance(latent_out_ls, latent_ori_ls)
+                avg_fgd = (speaker_fgd + listener_fgd) / 2
+                
+                # 存储指标
+                all_metrics['speaker_fgd'] = [speaker_fgd]
+                all_metrics['listener_fgd'] = [listener_fgd]
+                all_metrics['avg_fgd'] = [avg_fgd]
+                
+                logger.info(f"Speaker FGD: {speaker_fgd:.4f}")
+                logger.info(f"Listener FGD: {listener_fgd:.4f}")
+                logger.info(f"Avg FGD: {avg_fgd:.4f}")
+            
+            # L1Div
+            speaker_l1div = self.l1_calculator_speaker.avg()
+            listener_l1div = self.l1_calculator_listener.avg()
+            speaker_l1div_gt = self.l1_calculator_speaker_gt.avg()
+            listener_l1div_gt = self.l1_calculator_listener_gt.avg()
+            logger.info(f"Speaker L1Div: {speaker_l1div:.4f} (GT: {speaker_l1div_gt:.4f})")
+            logger.info(f"Listener L1Div: {listener_l1div:.4f} (GT: {listener_l1div_gt:.4f})")
+            
+            # BC
+            if all_metrics['speaker_bc']:
+                speaker_bc_avg = np.mean(all_metrics['speaker_bc'])
+                listener_bc_avg = np.mean(all_metrics['listener_bc'])
+                logger.info(f"Speaker BC: {speaker_bc_avg:.4f}")
+                logger.info(f"Listener BC: {listener_bc_avg:.4f}")
+            
+            logger.info("=" * 60)
+        
+        logger.info(f"Test completed. Results saved to {results_dir}")
+
 
 # 入口点
 if __name__ == "__main__":
     import argparse
+    import random
+    import numpy as np
+    import torch
     from omegaconf import OmegaConf
     from models.bidirectional_dyadic_lsm import BidirectionalDyadicLSM
     from dataloaders.bidirectional_dyadic_dataset import BidirectionalDyadicDataset
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
+    parser.add_argument("--mode", type=str, default="train",
+                       choices=["train", "test", "val"],
+                       help="Mode: train, test, or val")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="Checkpoint path for test/val mode")
+    parser.add_argument("--resume", type=str, default=None,
+                       help="Checkpoint path to resume training from")
+    parser.add_argument("--split", type=str, default="test",
+                       choices=["test", "val"],
+                       help="Dataset split for test mode: test or val (default: test)")
+    parser.add_argument("--min_seq_len", type=int, default=None,
+                       help="Minimum sequence length for testing (default: horizon + pre_frames_scaled)")
+    parser.add_argument("--max_seq_len", type=int, default=None,
+                       help="Maximum sequence length for testing (default: no limit)")
     args = parser.parse_args()
     
     # 加载配置
     cfg = OmegaConf.load(args.config)
     cfg.experiment_name = os.path.splitext(os.path.basename(args.config))[0]
+    
+    # 设置随机种子
+    def seed_everything(seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    seed = cfg.get('seed', 0)
+    seed_everything(seed)
+    logger.info(f"Set random seed to {seed}")
     
     # 创建模型
     model = BidirectionalDyadicLSM(cfg)
@@ -1551,4 +2025,15 @@ if __name__ == "__main__":
     
     # 创建训练器
     trainer = BidirectionalDyadicTrainer(cfg, model, train_ds, val_ds)
-    trainer.train(resume_from=args.resume)
+    
+    # 根据模式执行不同操作
+    if args.mode == "train":
+        trainer.train(resume_from=args.resume)
+    elif args.mode == "test":
+        if args.checkpoint is None:
+            raise ValueError("--checkpoint is required for test mode")
+        trainer.test(args.checkpoint, save_results=True, split=args.split)
+    elif args.mode == "val":
+        if args.checkpoint is None:
+            raise ValueError("--checkpoint is required for val mode")
+        trainer.validate(0, checkpoint_path=args.checkpoint)

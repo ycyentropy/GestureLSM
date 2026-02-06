@@ -87,8 +87,7 @@ class BidirectionalDyadicLSM(GestureLSM):
         return torch.clamp(flow_loss, max=1e6)
 
     def train_forward(self, speaker_data, listener_data,
-                      speaker_latent, listener_latent, train_consistency=True,
-                      separate_gradient_update=False, update_role='both'):
+                      speaker_latent, listener_latent, train_consistency=True):
         """
         [修改] 优化的训练前向传播，合并Batch
         """
@@ -111,7 +110,7 @@ class BidirectionalDyadicLSM(GestureLSM):
         # 目标: [Speaker, Listener]
         # 注意：latent 是 [B, T, 384]，需要 reshape 为 [B, 3, 128, T] 传入 Denoiser
         targets = torch.cat([speaker_latent, listener_latent], dim=0) # [2B, T, 384]
-        
+
         # 构造 Noisy Input
         x0_noise = torch.randn_like(targets)
         t = sample_beta_distribution(2 * batch_size, alpha=2, beta=1.2).to(device)
@@ -123,7 +122,7 @@ class BidirectionalDyadicLSM(GestureLSM):
         # 构造 Other Condition (Ground Truth)
         # 对于 Speaker，Other 是 Listener GT；对于 Listener，Other 是 Speaker GT
         # 所以 x_other 的顺序应该是 [Listener_GT, Speaker_GT]
-        x_other_targets = torch.cat([listener_latent, speaker_latent], dim=0) 
+        x_other_targets = torch.cat([listener_latent, speaker_latent], dim=0)
         x_other_denoiser = None
         if self.denoiser.use_bidirectional_attn:
             # [2B, T, 384] -> [2B, 3, 128, T]
@@ -163,33 +162,30 @@ class BidirectionalDyadicLSM(GestureLSM):
             target_v_sp = target_sp  # [B, 384, 1, T]
             target_v_ls = target_ls  # [B, 384, 1, T]
 
+        # 获取损失权重（alpha和1-alpha）
+        alpha = self.cfg.model.get('loss_alpha', 0.5)
+        speaker_weight = alpha
+        listener_weight = 1 - alpha
+
         loss_type = self.cfg.model.get('loss_type', 'mse')
-        losses['speaker_flow_loss'] = self.compute_flow_loss(speaker_pred, target_v_sp, t_sp, loss_type)
-        losses['listener_flow_loss'] = self.compute_flow_loss(listener_pred, target_v_ls, t_ls, loss_type)
+        losses['speaker_flow_loss'] = self.compute_flow_loss(speaker_pred, target_v_sp, t_sp, loss_type) * speaker_weight
+        losses['listener_flow_loss'] = self.compute_flow_loss(listener_pred, target_v_ls, t_ls, loss_type) * listener_weight
 
         # 7. Consistency Loss (保留部分采样逻辑，同样可以考虑合并)
         if train_consistency:
             # 为了代码简洁，这里暂时分别计算，如果需要极致优化也可以合并
             losses['speaker_cons_loss'] = self._compute_consistency_loss(
                 speaker_latent, speaker_data['seed'], at_feat_sp, x0_noise_sp
-            )
+            ) * speaker_weight
             losses['listener_cons_loss'] = self._compute_consistency_loss(
                 listener_latent, listener_data['seed'], at_feat_ls, x0_noise_ls
-            )
+            ) * listener_weight
         else:
             losses['speaker_cons_loss'] = torch.tensor(0.0, device=device)
             losses['listener_cons_loss'] = torch.tensor(0.0, device=device)
 
         # 8. 汇总 Loss
-        total_loss = 0
-        if separate_gradient_update:
-            if update_role == 'speaker' or update_role == 'both':
-                total_loss += losses['speaker_flow_loss'] + losses['speaker_cons_loss']
-            if update_role == 'listener' or update_role == 'both':
-                total_loss += losses['listener_flow_loss'] + losses['listener_cons_loss']
-        else:
-            total_loss = sum(losses.values())
-
+        total_loss = sum(losses.values())
         losses['loss'] = total_loss
         return losses
 
@@ -200,26 +196,106 @@ class BidirectionalDyadicLSM(GestureLSM):
 
     # 这里的 _original_consistency_loss 对应你 prompt 中提供的 _compute_consistency_loss 实现
     def _original_consistency_loss(self, latent, seed, at_feat, x0_noise):
+        """
+        完整的consistency损失实现，与原框架保持一致
+        """
         batch_size = latent.shape[0]
         device = latent.device
-        cons_batch_size = max(1, batch_size // 4)
-        
+
+        # 1. 采样delta和t
         deltas = 1 / torch.tensor([2 ** i for i in range(1, 8)]).to(device)
-        d = deltas[torch.randint(len(deltas), (batch_size,), device=device)] # Simplified sampling
-        
+        delta_probs = torch.ones((deltas.shape[0],)).to(device) / deltas.shape[0]
+
+        # 2. 分割batch：75% flow, 25% consistency
+        flow_batch_size = int(batch_size * 3 / 4)
+        cons_batch_size = batch_size - flow_batch_size
+
+        # 3. 采样t和d
         t = sample_beta_distribution(batch_size, alpha=2, beta=1.2).to(device)
+        d = deltas[delta_probs.multinomial(batch_size, replacement=True)]
+        d[:flow_batch_size] = 0  # flow部分d=0
+
+        # 4. 计算x_t
         t_coef = reshape_coefs(t)
         x_t = t_coef * latent + (1 - t_coef) * x0_noise
-        
-        # CFG zero masking
-        at_feat_cfg = at_feat.clone()
-        if torch.rand(1).item() < 0.5: # 简单化 random drop
-             mask_indices = torch.rand(batch_size, device=device) < 0.5
-             at_feat_cfg[mask_indices] = 0
+        t = t_coef.flatten()
 
-        # Run consistency steps (省略具体实现，假设与原文件一致)
-        # ...
-        return torch.tensor(0.0, device=device, requires_grad=True) # Placeholder, 请填回原逻辑
+        # 将x_t reshape为denoiser期望的格式 [B, T, 384] -> [B, 3, 128, T]
+        x_t_denoiser = x_t.reshape(batch_size, -1, 3, 128).permute(0, 2, 3, 1)
+
+        # 5. CFG处理（80% true, 20% false）
+        import numpy as np
+        force_cfg = np.random.choice(
+            [True, False], size=cons_batch_size, p=[0.8, 0.2]
+        )
+
+        # Apply force_cfg
+        at_feat_cfg = at_feat.clone()
+        # 对于consistency部分应用CFG
+        for i in range(cons_batch_size):
+            if force_cfg[i]:
+                at_feat_cfg[flow_batch_size + i] = 0
+
+        # 6. 第一步：计算v_t（无梯度）
+        with torch.no_grad():
+            pred_t = self.denoiser(
+                x=x_t_denoiser[flow_batch_size:],
+                timesteps=t[flow_batch_size:],
+                seed=seed[flow_batch_size:],
+                at_feat=at_feat_cfg[flow_batch_size:],
+                cond_time=d[flow_batch_size:],
+            )
+
+            d_coef = reshape_coefs(d)
+            if self.flow_mode == "v":
+                speed_t = pred_t
+            else:
+                # 需要将x0_noise也reshape为[B, 3, 128, T]
+                x0_noise_denoiser = x0_noise.reshape(batch_size, -1, 3, 128).permute(0, 2, 3, 1)
+                speed_t = pred_t - x0_noise_denoiser[flow_batch_size:]
+
+            # 将speed_t reshape回[B, T, 384]用于计算x_td
+            speed_t_reshaped = speed_t.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, 384)
+            x_td = x_t[flow_batch_size:] + d_coef[flow_batch_size:] * speed_t_reshaped
+            # 将x_td reshape回[B, 3, 128, T]用于denoiser
+            x_td_denoiser = x_td.reshape(cons_batch_size, -1, 3, 128).permute(0, 2, 3, 1)
+            d = d_coef.flatten()
+
+            # 7. 第二步：计算v_{t+d}（无梯度）
+            pred_td = self.denoiser(
+                x=x_td_denoiser,
+                timesteps=t[flow_batch_size:] + d[flow_batch_size:],
+                seed=seed[flow_batch_size:],
+                at_feat=at_feat_cfg[flow_batch_size:],
+                cond_time=d[flow_batch_size:],
+            )
+
+            if self.flow_mode == "v":
+                speed_td = pred_td
+            else:
+                speed_td = pred_td - x0_noise_denoiser[flow_batch_size:]
+
+            # 8. 计算目标速度
+            speed_target = (speed_t + speed_td) / 2
+
+        # 9. 第三步：计算v_t（有梯度，使用2d作为cond_time）
+        model_pred = self.denoiser(
+            x=x_t_denoiser[flow_batch_size:],
+            timesteps=t[flow_batch_size:],
+            seed=seed[flow_batch_size:],
+            at_feat=at_feat_cfg[flow_batch_size:],
+            cond_time=2 * d[flow_batch_size:],
+        )
+
+        if self.flow_mode == "v":
+            speed_pred = model_pred
+        else:
+            speed_pred = model_pred - x0_noise_denoiser[flow_batch_size:]
+
+        # 10. 计算MSE损失
+        consistency_loss = F.mse_loss(speed_pred, speed_target, reduction="mean")
+
+        return consistency_loss
 
     @torch.no_grad()
     def generate(self, speaker_data, listener_data, 

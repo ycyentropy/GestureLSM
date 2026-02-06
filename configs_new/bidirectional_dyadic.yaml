@@ -2,6 +2,7 @@
 # 同时生成Speaker和Listener的手势
 
 experiment_name: "bidirectional_dyadic_seamless"
+seed: 42  # 随机种子，用于保证实验可重复性
 
 # 归一化文件路径 (根级别，供训练器直接访问)
 mean_pose_path: "mean_std_seamless/seamless_2_330_mean.npy"
@@ -34,7 +35,8 @@ model:
   # 损失函数配置
   loss_type: "huber"     # "mse" 或 "huber"
   flow_mode: "v"       # "v" (velocity) 或 "x1" (direct)
-  
+  loss_alpha: 0.8      # speaker损失权重，listener权重为1-alpha
+
   # ★ ID信息开关参数
   use_id: false             # 是否使用ID信息
   main_id_weight: 0.6       # Main角色ID权重
@@ -64,7 +66,7 @@ model:
       cond_proj_dim: 256  # 用于consistency loss的时间条件投影
       # ★ 双向交叉注意力配置（用于双人交互）
       use_bidirectional_attn: true   # 启用Speaker-Listener双向交叉注意力
-      bidirectional_layers: 2        # 双向交叉注意力层数
+      bidirectional_layers: 3        # 双向交叉注意力层数
       bidirectional_fusion: "add"    # 融合策略: add 或 concat
       
   # Modality Encoder配置
@@ -101,6 +103,8 @@ data:
   # 数据集路径
   train_data_path: "datasets/seamless_interaction/improvised/train"
   val_data_path: "datasets/seamless_interaction/improvised/val"
+  test_data_path: "datasets/seamless_interaction/improvised/test"
+  test_speakers: null  # 测试集说话人ID列表，null表示使用所有
   
   # 归一化文件路径
   mean_pose_path: "mean_std_seamless/seamless_2_330_mean.npy"
@@ -182,6 +186,32 @@ dataset:
       audio_rep: ${data.audio_rep}
       audio_sr: ${data.audio_sr}
 
+  test:
+    target: dataloaders.bidirectional_dyadic_dataset.BidirectionalDyadicDataset
+    params:
+      data_path: ${data.test_data_path}
+      window_size: ${data.window_size}
+      horizon: ${data.horizon}
+      stride: ${data.stride}
+      min_speak_duration: ${data.min_speak_duration}
+      pose_fps: ${data.pose_fps}
+      audio_fps: ${data.audio_fps}
+      audio_norm: ${data.audio_norm}
+      pose_norm: ${data.pose_norm}
+      mean_pose_path: ${data.mean_pose_path}
+      std_pose_path: ${data.std_pose_path}
+      use_lmdb: ${data.use_lmdb}
+      cache_dir: "cache/bidirectional_dyadic_test"
+      new_cache: false
+      training_speakers: ${data.test_speakers}
+      disable_filtering: ${data.disable_filtering}
+      clean_first_seconds: ${data.clean_first_seconds}
+      clean_final_seconds: ${data.clean_final_seconds}
+      skip_segmentation: ${data.skip_segmentation}
+      vocab_path: ${model.modality_encoder.params.vocab_path}
+      audio_rep: ${data.audio_rep}
+      audio_sr: ${data.audio_sr}
+
 # ==================== VQ-VAE配置 ====================
 vqvae_upper_path: "ckpt/net_seamless_64frame_4096batch_128dim_1024code_upper_best.pth"
 vqvae_hands_path: "ckpt/net_seamless_64frame_4096batch_128dim_1024code_hands_best.pth"
@@ -189,8 +219,8 @@ vqvae_lower_path: "ckpt/net_seamless_64frame_4096batch_128dim_1024code_lower_bes
 
 # ==================== 训练配置 ====================
 trainer:
-  batch_size: 128
-  val_batch_size: 64  # 验证时的batch size
+  batch_size: 32
+  val_batch_size: 32  # 验证时的batch size
   num_workers: 4
   max_epochs: 1000
   
@@ -198,25 +228,25 @@ trainer:
   max_val_iterations: 10  # 验证时的最大迭代次数，null表示验证所有数据
   
   # 优化器配置
-  lr: 1.0e-5
+  lr: 2.0e-5
   weight_decay: 1.0e-5
   grad_norm: 5.0 #0.5
   
   # 学习率调度
   lr_scheduler: "cosine"
-  warmup_epochs: 5
+  warmup_epochs: 10
   
   # 保存和日志
   save_interval: 10
   log_interval: 1
-  val_interval: 5  # 验证间隔
+  val_interval: 10  # 验证间隔
 
   # 混合精度训练
   use_amp: true
 
   # 早停机制配置
   early_stopping_patience: 10  # 早停耐心值
-  early_stopping_min_delta: 0.001  # 早停最小改进阈值
+  early_stopping_min_delta: 0.0001  # 早停最小改进阈值
 
   # ★ 梯度更新模式配置
   separate_gradient_update: true  # 是否分开更新Speaker和Listener的梯度
