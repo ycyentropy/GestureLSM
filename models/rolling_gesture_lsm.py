@@ -184,7 +184,10 @@ class RollingGestureLSM(GestureLSM):
         flow_batch_size = int(batch_size * (1 - self.consistency_ratio))
         
         max_start = seq_len - self.window_size - self.context_size
-        j = torch.randint(0, max_start, (1,)).item()
+        if max_start <= 0:
+            j = 0
+        else:
+            j = torch.randint(0, max_start, (1,)).item()
         
         window_start = j + self.context_size
         window_end = window_start + self.window_size
