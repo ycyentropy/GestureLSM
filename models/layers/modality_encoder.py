@@ -129,7 +129,22 @@ class ModalityEncoder(nn.Module):
             
             at_feat = torch.cat([audio_feat, raw_feat, text_feat], dim=2)
         else:
-            at_feat = torch.cat([audio_feat, text_feat], dim=2)  # [B, T, D]
+            # 对齐 audio_feat 和 text_feat 的时间维度
+            audio_len = audio_feat.shape[1]  # 目标长度
+            text_len = text_feat.shape[1]
+            
+            if text_len != audio_len:
+                # 使用插值对齐文本特征到音频特征长度
+                text_feat_aligned = F.interpolate(
+                    text_feat.transpose(1, 2),  # [B, D, T]
+                    size=audio_len,
+                    mode='linear',
+                    align_corners=True
+                ).transpose(1, 2)  # [B, T, D]
+            else:
+                text_feat_aligned = text_feat
+            
+            at_feat = torch.cat([audio_feat, text_feat_aligned], dim=2)  # [B, T, D]
         
         at_feat = self.mix_audio_text(at_feat)  # [B, T, D']
         

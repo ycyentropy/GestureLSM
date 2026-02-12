@@ -84,7 +84,12 @@ class TimestepEmbedder(nn.Module):
         )
 
     def forward(self, timesteps):
-        return self.time_embed(self.sequence_pos_encoder.pe[timesteps]).permute(1, 0, 2)
+        # timesteps: [B] - 原始设计是 1D
+        # self.sequence_pos_encoder.pe: [max_len, 1, d_model]
+        # pe[timesteps]: [B, 1, d_model]
+        pe_embed = self.sequence_pos_encoder.pe[timesteps]
+        # 输出形状: [B, d_model]
+        return self.time_embed(pe_embed).squeeze(0)
 
 
 class InputProcess(nn.Module):

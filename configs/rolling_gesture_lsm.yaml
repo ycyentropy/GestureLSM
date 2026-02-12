@@ -1,0 +1,209 @@
+# ============================================================================
+# 滚动GestureLSM模型配置文件
+# 基于seamless_shortcut_rvqvae_128_test_48000.yaml重构
+# ============================================================================
+
+# ============================================================================
+# 基础配置
+# ============================================================================
+wandb_project: 'GestureLSM'
+exp_name: 'rolling_gesture_lsm'
+wandb_entity: 'xxxx'
+wandb_key: "xxxxxxx"
+wandb_log_dir: './outputs/wandb'
+output_dir: ./outputs/audio2pose/
+log_period: 20
+val_period: 20
+gpus: [0]
+seed: 42
+ddp: false
+debug: false
+
+# ============================================================================
+# VQVAE路径配置
+# ============================================================================
+vqvae_upper_path: ./outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_upper/net_best.pth
+vqvae_hands_path: ./outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_hands/net_best.pth
+vqvae_lower_path: ./outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_lower_trans/net_best.pth
+
+pre_frames: 4
+pose_length: 128
+vqvae_squeeze_scale: 4
+vqvae_latent_scale: 5
+vae_length: 240
+vae_test_len: 32
+
+# ============================================================================
+# 归一化文件路径
+# ============================================================================
+mean_pose_path: "./mean_std_seamless/mean_pose.npy"
+std_pose_path: "./mean_std_seamless/std_pose.npy"
+mean_trans_path: "./mean_std_seamless/mean_trans.npy"
+std_trans_path: "./mean_std_seamless/std_trans.npy"
+
+# ============================================================================
+# 数据加载配置
+# ============================================================================
+name_pyfile: "dataloaders.seamless_interaction_dataset"
+class_name: "CustomDataset"
+# train_bs: 256  # 减小 batch size 以加速测试128
+batch_size: 256  # 减小 batch size 以加速测试
+multi_length_training: [1.0]
+root_path: ./
+beat_align: True
+
+# ============================================================================
+# 姿态表示配置
+# ============================================================================
+pose_rep: smplxflame_30
+pose_norm: True
+pose_fps: 30
+rot6d: True
+pose_dims: 825
+stride: 20
+test_length: 128
+
+# ============================================================================
+# 音频配置
+# ============================================================================
+audio_sr: 48000
+audio_fps: 100
+audio_norm: False
+audio_rep: mfcc
+
+# ============================================================================
+# 文本配置
+# ============================================================================
+word_rep: json
+t_pre_encoder: fasttext
+
+# ============================================================================
+# 其他模态配置
+# ============================================================================
+facial_rep: null
+id_rep: integer
+emo_rep: null
+sem_rep: null
+onset_rep: True
+
+# ============================================================================
+# 数据路径配置
+# ============================================================================
+data_path_1: ./datasets/hub/
+data_path: ./datasets/seamless_interaction/improvised/
+training_speakers: []
+additional_data: False
+cache_path: ./datasets/seamless_cache/seamless_smplx_128_48000_mfcc_id/
+new_cache: False
+disable_filtering: False
+clean_first_seconds: 0
+clean_final_seconds: 0
+test_clip: False
+
+# ============================================================================
+# 模型配置
+# ============================================================================
+model:
+  model_name: LSM
+  g_name: GestureLSM
+  do_classifier_free_guidance: True
+  guidance_scale: 2
+  n_steps: 2
+  use_exp: False
+  use_id: False
+  max_id: 5000
+  id_embedding_dim: 256
+  # 滚动窗口配置
+  window_size: 24
+  context_size: 8
+  noise_range: [0, 1]
+  # RDLA 阶梯加速配置
+  ladder_step: 1  # 阶梯步长，1为标准滚动，2/4/8为加速模式
+  inertia_weight: 0.1  # 惯性损失权重，惩罚相邻帧突变
+  ofs_threshold: 0.8  # OFS平滑阈值，低于此值触发平滑
+  # Consistency Loss 配置
+  consistency_ratio: 0.25  # consistency batch比例
+  # CFG 配置
+  cond_drop_prob: 0.1  # 条件dropout概率
+  denoiser:
+    target: models.denoiser.GestureDenoiser
+    params:
+      input_dim: 128
+      latent_dim: 256
+      ff_size: 1024
+      num_layers: 8
+      num_heads: 4
+      dropout: 0.1
+      activation: "gelu"
+      n_seed: 8
+      seq_len: 32
+      flip_sin_to_cos: True
+      freq_shift: 0.0
+      cond_proj_dim: 512
+      use_exp: ${model.use_exp}
+  modality_encoder:
+    target: models.layers.modality_encoder.ModalityEncoder
+    params:
+      data_path: ./datasets/seamless_interaction/improvised/
+      vocab_path: ./datasets/unified_vocab.pkl
+      t_fix_pre: False
+      audio_dim: 256
+      audio_in: 128
+      raw_audio: False
+      latent_dim: 256
+      audio_fps: 100
+      target_length: 128
+      spatial_temporal: True
+      use_exp: ${model.use_exp}
+
+# ============================================================================
+# 验证配置
+# ============================================================================
+validation:
+  val_loss_steps: 200
+  validation_steps: 1000
+  test_period: 20
+
+# ============================================================================
+# 训练求解器配置
+# ============================================================================
+solver:
+  opt: 'adam'
+  epochs: 1000
+  grad_norm: 1.0
+  momentum: 0.8
+  nesterov: True
+  amsgrad: False
+  lr_base: 1e-5
+  lr_policy: 'step'
+  decay_rate: 0
+  lr_warmup_steps: 50
+  decay_epochs: 500
+  warmup_epochs: 100
+  warmup_lr: 1e-6
+  lr_min: 1e-7
+  weight_decay: 0.0
+  opt_betas: [0.5, 0.999]
+
+# ============================================================================
+# 早停配置
+# ============================================================================
+early_stopping:
+  enabled: true
+  patience: 5
+  delta: 0.001
+
+# ============================================================================
+# 流匹配配置
+# ============================================================================
+flow_mode: "v"
+
+# ============================================================================
+# 模型架构配置文件
+# ============================================================================
+cfg: configs/sc_model_config.yaml
+
+# ============================================================================
+# VQVAE配置
+# ============================================================================
+use_trans: True

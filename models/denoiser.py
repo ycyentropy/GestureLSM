@@ -93,7 +93,7 @@ class GestureDenoiser(nn.Module):
         else:
             self.bidirectional_attn_blocks = None
             
-        self.embed_timestep = TimestepEmbedder(self.latent_dim, self.sequence_pos_encoder)
+        # self.embed_timestep = TimestepEmbedder(self.latent_dim, self.sequence_pos_encoder) #发现未被使用
         
         # 调整 embed_text 输入维度以适应 seed 形状
         # seed_in shape: [bs_curr, n_seed, 384]，展平后为 [bs_curr, n_seed*384]
@@ -260,7 +260,8 @@ class GestureDenoiser(nn.Module):
         xseq = self.input_process(x_in)
 
         # 4. Fuse Style/Time
-        # [bs_curr, joint_num, nframes, latent_dim]
+        # emb_seed 和 emb_t 形状: [batch_size, latent_dim]
+        # xseq 形状: [batch_size, joint_num, nframes, latent_dim]
         embed_style_2 = (emb_seed + emb_t).unsqueeze(1).unsqueeze(2).expand(-1, self.joint_num, nframes, -1)
         xseq = torch.cat([embed_style_2, xseq], axis=-1)
         xseq = self.input_process2(xseq)
