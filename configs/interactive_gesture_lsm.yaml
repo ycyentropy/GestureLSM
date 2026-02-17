@@ -1,0 +1,188 @@
+wandb_project: 'GestureLSM'
+exp_name: 'interactive_gesture_lsm'
+
+wandb_entity: 'xxxx'
+wandb_key: "xxxxxxx"
+wandb_log_dir: './outputs/wandb'
+output_dir: ./outputs/interactive_gesture_lsm
+log_period: 50
+val_period: 10
+max_val_samples: 10
+
+# ============================================
+# 单卡训练配置（默认）
+# ============================================
+gpus: [0]
+ddp: false
+
+# ============================================
+# 多卡分布式训练配置示例
+# 取消注释以下配置并注释上面的单卡配置即可启用
+# ============================================
+# gpus: [0, 1, 2, 3]  # 使用的 GPU 列表
+# ddp: true           # 启用分布式数据并行
+# 注意：多卡训练时，总 batch size = train_bs * len(gpus)
+# 例如：train_bs=64, gpus=[0,1,2,3] -> 总 batch size = 256
+
+seed: 0 #42
+debug: false
+
+vqvae_upper_path: ./outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_upper/net_best.pth
+vqvae_hands_path: ./outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_hands/net_best.pth
+vqvae_lower_path: ./outputs/rvq_seamless/seamless_64frame_1024batch_128dim_1024code_lower_trans/net_best.pth
+
+grad_ckpt: false
+
+# 是否使用 translation 数据
+# true: 使用真实的 translation 数据 (lower body 维度 57)
+# false: 使用零填充代替 translation (保持维度 57，但 translation 部分为零)
+use_trans: False
+
+pre_frames: 8
+vqvae_squeeze_scale: 4
+vqvae_latent_scale: 5
+vae_length: 240
+vae_test_len: 32
+mean_pose_path: "./mean_std_seamless/mean_pose.npy"
+std_pose_path: "./mean_std_seamless/std_pose.npy"
+mean_trans_path: "./mean_std_seamless/mean_trans.npy"
+std_trans_path: "./mean_std_seamless/std_trans.npy"
+
+data:
+  name_pyfile: "dataloaders.dyadic_feedback_dataset"
+  class_name: "DyadicFeedbackDataset"
+  train_bs: 128 #128
+  multi_length_training: [1.0]
+  root_path: ./
+  beat_align: True
+  pose_rep: smplxflame_30
+  
+  pose_norm: True
+  pose_fps: 30
+  rot6d: True
+  pose_dims: 825
+  pose_length: 256 #128
+  stride: 60
+  test_length: 256 #128
+  audio_sr: 48000
+  audio_fps: 100
+  audio_norm: False
+  
+  data_path_1: ./datasets/hub/
+  data_path: ./datasets/seamless_interaction/improvised/
+  additional_data: False
+  cache_path: ./cache/dyadic_feedback
+  cache_dir: ./cache/dyadic_feedback
+  new_cache: False
+  disable_filtering: False
+  clean_first_seconds: 0
+  clean_final_seconds: 0
+  min_speak_duration: 10.0 #5.0
+
+  audio_rep: mfcc
+  word_rep: json
+  t_pre_encoder: fasttext
+  facial_rep: null
+  id_rep: integer
+  emo_rep: null
+  sem_rep: null
+  test_clip: False
+  onset_rep: True
+
+model:
+  model_name: interactive_gesture_lsm
+  g_name: InteractiveGestureLSM
+  do_classifier_free_guidance: True
+  guidance_scale: 2.0
+  n_steps: 4
+  use_exp: False
+  use_id: False
+  max_id: 5000
+  id_embedding_dim: 256
+  
+  denoiser:
+    target: models.interactive_denoiser.InteractiveGestureDenoiser
+    params:
+      input_dim: 128
+      latent_dim: 256
+      ff_size: 1024
+      num_layers: 8
+      num_heads: 4
+      dropout: 0.1
+      activation: "gelu"
+      n_seed: 8
+      seq_len: 64 #32
+      flip_sin_to_cos: True
+      freq_shift: 0.0
+      cond_proj_dim: 512
+      use_exp: ${model.use_exp}
+      num_feedback_attn_layers: 3
+      embed_context_multiplier: 2
+  
+  modality_encoder:
+    target: models.layers.modality_encoder.ModalityEncoder
+    params:
+      data_path: ./datasets/seamless_interaction/improvised/
+      vocab_path: ./datasets/unified_vocab.pkl
+      t_fix_pre: False
+      audio_dim: 256
+      audio_in: 128
+      raw_audio: False
+      latent_dim: 256
+      audio_fps: 100
+      target_length: 256 #128
+      spatial_temporal: True
+      use_exp: ${model.use_exp}
+
+  window_size: 24
+  context_size: 8
+  ladder_step: 8
+  noise_range: [0, 1]
+  
+  # 实时模式：Listener 使用历史动作而非未来动作
+  # 适用于机器人部署等实时生成场景
+  # realtime_mode: true
+  
+  # 是否使用 Listener 反馈（消融实验用）
+  # 设为 false 可禁用 Listener 视觉反馈，仅使用音频生成动作
+  use_listener_feedback: true
+  
+  inertia_weight: 0.2
+  ofs_threshold: 0.8
+  consistency_ratio: 0.25
+  
+  cond_drop_prob: 0.1
+  context_noise_prob: 0.3
+  max_context_noise: 0.01
+  listener_drop_prob: 0.1
+
+validation:
+  val_loss_steps: 200
+  validation_steps: 1000
+  # 在线交互模式验证：模拟真实在线交互场景
+  # 使用 OnlineListenerLoader 按时间步提供 Listener 历史
+  # online_validation: true
+
+solver:
+  opt: 'adam'
+  epochs: 1000
+  grad_norm: 1.0
+  momentum: 0.8
+  nesterov: True
+  amsgrad: False
+  
+  lr_base: 1e-5
+  lr_policy: 'step'
+  decay_rate: 0.1
+  lr_warmup_steps: 50
+  decay_epochs: 500
+  warmup_epochs: 100
+  warmup_lr: 1e-6
+  lr_min: 1e-7
+  weight_decay: 1e-2
+  opt_betas: [0.5, 0.999]
+  
+  early_stopping:
+    enabled: true
+    patience: 5
+    delta: 0.001
