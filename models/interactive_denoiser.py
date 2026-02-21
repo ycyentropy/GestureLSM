@@ -50,7 +50,7 @@ class InteractiveGestureDenoiser(nn.Module):
 
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
 
-        self.cross_attn_context_dim = self.input_dim * self.joint_num * self.embed_context_multiplier
+        self.cross_attn_context_dim = self.latent_dim * self.joint_num
 
         self.cross_attn_blocks = nn.ModuleList([
             CrossAttentionBlock(
@@ -96,7 +96,7 @@ class InteractiveGestureDenoiser(nn.Module):
         time_dim = self.latent_dim
         self.time_proj = Timesteps(time_dim, flip_sin_to_cos, freq_shift)
         if cond_proj_dim is not None:
-            self.cond_proj = Timesteps(cond_proj_dim, flip_sin_to_cos, freq_shift)
+            self.cond_proj = Timesteps(time_dim, flip_sin_to_cos, freq_shift)
         
         self.null_cond_embed = nn.Parameter(torch.zeros(self.seq_len, self.latent_dim * self.joint_num), requires_grad=True)
         
@@ -114,56 +114,28 @@ class InteractiveGestureDenoiser(nn.Module):
 
     def get_null_cond_embed(self, target_seq_len, target_feat_dim, device):
         """
-        获取 null condition embedding，支持不同的时间长度和特征维度
+        获取 null condition embedding
         
         Args:
             target_seq_len: 目标序列长度（时间维度）
             target_feat_dim: 目标特征维度
             device: 设备
+            
+        Raises:
+            ValueError: 如果维度不匹配
         """
         current_seq_len, current_feat_dim = self.null_cond_embed.shape
         
-        # 检查是否需要调整
-        need_seq_resize = current_seq_len != target_seq_len
-        need_feat_resize = current_feat_dim != target_feat_dim
+        if current_seq_len != target_seq_len or current_feat_dim != target_feat_dim:
+            raise ValueError(
+                f"null_cond_embed dimension mismatch! "
+                f"Expected ({target_seq_len}, {target_feat_dim}), "
+                f"but got ({current_seq_len}, {current_feat_dim}). "
+                f"Please check config: seq_len should equal audio feature sequence length, "
+                f"and latent_dim*joint_num should match audio feature dimension."
+            )
         
-        if not need_seq_resize and not need_feat_resize:
-            return self.null_cond_embed.to(device)
-        
-        if self.training:
-            print(f"Warning: Requesting null_cond_embed resize from ({current_seq_len}, {current_feat_dim}) to ({target_seq_len}, {target_feat_dim}) during training.")
-        
-        # 先处理特征维度
-        if need_feat_resize:
-            if target_feat_dim > current_feat_dim:
-                feat_data = torch.cat([
-                    self.null_cond_embed.data.to(device),
-                    torch.randn(current_seq_len, target_feat_dim - current_feat_dim, device=device) * 0.01
-                ], dim=1)
-            else:
-                feat_data = self.null_cond_embed.data.to(device)[:, :target_feat_dim]
-        else:
-            feat_data = self.null_cond_embed.data.to(device)
-        
-        # 再处理时间维度
-        if need_seq_resize:
-            if target_seq_len > current_seq_len:
-                # 插值扩展
-                null_embed = feat_data.unsqueeze(0).transpose(1, 2)  # [1, feat_dim, seq_len]
-                null_embed = torch.nn.functional.interpolate(
-                    null_embed, size=target_seq_len, mode='linear', align_corners=False
-                )
-                null_embed = null_embed.transpose(1, 2).squeeze(0)  # [target_seq_len, feat_dim]
-            else:
-                null_embed = feat_data[:target_seq_len, :]
-        else:
-            null_embed = feat_data
-        
-        if not self.training:
-            return null_embed
-        else:
-            self.null_cond_embed = nn.Parameter(null_embed, requires_grad=True)
-            return self.null_cond_embed
+        return self.null_cond_embed.to(device)
 
     def forward(self, x, timesteps, cond_time=None, seed=None, at_feat=None, listener_latent=None):
         if x.dim() == 4 and x.shape[-1] == 1:
@@ -179,6 +151,7 @@ class InteractiveGestureDenoiser(nn.Module):
         time_emb = time_emb.to(dtype=x.dtype)
 
         if cond_time is not None and hasattr(self, 'cond_proj') and self.cond_proj is not None:
+            cond_time = cond_time.expand(bs_curr).clone()
             cond_emb = self.cond_proj(cond_time)
             cond_emb = cond_emb.to(dtype=x.dtype)
             emb_t = self.time_embedding(time_emb, cond_emb)

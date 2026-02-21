@@ -23,31 +23,20 @@ class CausalCrossAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
 
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.context_dim = context_dim
+        self.context_dim = context_dim if context_dim is not None else dim
+        self.kv = nn.Linear(self.context_dim, dim * 2, bias=False)
         
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        
-        if context_dim is not None:
-            self.kv = nn.Linear(context_dim, dim * 2, bias=False)
-        else:
-            self.kv = None
 
     def forward(self, x, context, attn_mask=None):
         B, N, C = x.shape
-        M, context_dim = context.shape[1], context.shape[2]
+        M = context.shape[1]
 
         q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        
-        if self.kv is None or context_dim != self.context_dim:
-            if self.kv is not None:
-                from loguru import logger
-                logger.warning(f"Context dim changed from {self.context_dim} to {context_dim}, reinitializing KV layer")
-            self.context_dim = context_dim
-            self.kv = nn.Linear(self.context_dim, C * 2, bias=False).to(x.device)
         
         kv = self.kv(context).reshape(B, M, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         k, v = kv.unbind(0)

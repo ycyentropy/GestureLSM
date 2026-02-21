@@ -25,6 +25,7 @@ class GestureDenoiser(nn.Module):
         use_exp=False,
         seq_len=32,
         embed_context_multiplier=4,
+        cross_attn_context_dim=None,  # Direct override for context dimension
         use_id=False,
         id_embedding_dim=256,
         use_bidirectional_attn=False,
@@ -53,7 +54,11 @@ class GestureDenoiser(nn.Module):
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
 
         # Cross attention context dimension
-        self.cross_attn_context_dim = self.input_dim * self.joint_num * self.embed_context_multiplier
+        # Use direct override if provided, otherwise compute from embed_context_multiplier
+        if cross_attn_context_dim is not None:
+            self.cross_attn_context_dim = cross_attn_context_dim
+        else:
+            self.cross_attn_context_dim = self.input_dim * self.joint_num * self.embed_context_multiplier
 
         # [修改] 使用参数控制层数，而非硬编码 range(3)
         self.cross_attn_blocks = nn.ModuleList([
@@ -111,7 +116,7 @@ class GestureDenoiser(nn.Module):
         time_dim = self.latent_dim
         self.time_proj = Timesteps(time_dim, flip_sin_to_cos, freq_shift)
         if cond_proj_dim is not None:
-            self.cond_proj = Timesteps(cond_proj_dim, flip_sin_to_cos, freq_shift)
+            self.cond_proj = Timesteps(time_dim, flip_sin_to_cos, freq_shift)
         
         # Null condition embedding for classifier-free guidance
         self.null_cond_embed = nn.Parameter(torch.zeros(self.seq_len, self.latent_dim * self.joint_num), requires_grad=True)
@@ -134,37 +139,25 @@ class GestureDenoiser(nn.Module):
     
     def get_null_cond_embed(self, target_dim, device):
         """
-        获取 Null condition embedding。
-        注意：在训练过程中修改 Parameter 形状是非常危险的，会导致优化器失效。
-        此修改仅保留安全性检查。
+        获取 null condition embedding
+        
+        Args:
+            target_dim: 目标特征维度
+            device: 设备
+            
+        Raises:
+            ValueError: 如果维度不匹配
         """
         current_dim = self.null_cond_embed.shape[1]
         
-        if current_dim == target_dim:
-            return self.null_cond_embed.to(device)
+        if current_dim != target_dim:
+            raise ValueError(
+                f"null_cond_embed dimension mismatch! "
+                f"Expected {target_dim}, but got {current_dim}. "
+                f"Please check config: latent_dim*joint_num should match audio feature dimension."
+            )
         
-        if self.training:
-            # 训练模式下警告，避免静默错误
-            print(f"Warning: Requesting null_cond_embed resize from {current_dim} to {target_dim} during training. This may break the optimizer.")
-
-        # 如果维度不匹配，创建一个临时的 Tensor (如果是推理阶段) 或者尝试 Parameter (如果在初始化阶段)
-        # 这里为了保持原逻辑的兼容性，进行动态调整，但需谨慎使用
-        if target_dim > current_dim:
-            new_data = torch.cat([
-                self.null_cond_embed.data.to(device),
-                torch.randn(self.seq_len, target_dim - current_dim, device=device) * 0.01
-            ], dim=1)
-        else:
-            new_data = self.null_cond_embed.data.to(device)[:, :target_dim]
-            
-        if not self.training:
-             # 推理时不更新梯度，直接返回 Tensor 即可，不修改 self.null_cond_embed
-            return new_data
-        else:
-            # 训练时必须重置 Parameter，但如前所述，这通常不可行。
-            # 建议确保初始化时的 dim 就是最大所需 dim
-            self.null_cond_embed = nn.Parameter(new_data, requires_grad=True)
-            return self.null_cond_embed
+        return self.null_cond_embed.to(device)
 
     def forward(self, x, timesteps, cond_time=None, seed=None, at_feat=None, x_other=None):
         """
@@ -229,7 +222,7 @@ class GestureDenoiser(nn.Module):
         time_emb = time_emb.to(dtype=x_in.dtype)
 
         if cond_time_in is not None and self.cond_proj is not None:
-            # cond_time 已在上面处理过维度
+            cond_time_in = cond_time_in.expand(bs_curr).clone()
             cond_emb = self.cond_proj(cond_time_in)
             cond_emb = cond_emb.to(dtype=x_in.dtype)
             emb_t = self.time_embedding(time_emb, cond_emb)
@@ -238,23 +231,9 @@ class GestureDenoiser(nn.Module):
         
         # 2. Seed Embedding
         if self.n_seed != 0 and seed_in is not None and self.embed_text is not None:
-            # seed_in shape: [bs_curr, n_seed, 384]
-            # 展平为 [bs_curr, n_seed*384]
-            # 但实际输入可能已经是展平的，所以先检查形状
-            if seed_in.ndim == 3:
-                # 三维输入：[bs_curr, n_seed, 384]
-                # 取前4帧以匹配输入维度
-                if seed_in.shape[1] > 4:
-                    seed_in = seed_in[:, :4, :]
-                emb_seed = self.embed_text(seed_in.reshape(bs_curr, -1))
-            else:
-                # 二维输入：[bs_curr, n_seed*384]
-                # 取前1536个特征以匹配输入维度
-                if seed_in.shape[1] > 1536:
-                    seed_in = seed_in[:, :1536]
-                emb_seed = self.embed_text(seed_in)
+            emb_seed = self.embed_text(seed_in.reshape(bs_curr, -1))
         else:
-            emb_seed = 0 # 避免未定义
+            emb_seed = 0
 
         # 3. Input Process
         xseq = self.input_process(x_in)

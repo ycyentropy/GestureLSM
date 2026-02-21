@@ -181,23 +181,18 @@ class CrossAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
-        self._force_no_fused_attn = False  # Add flag to force disable fused attention
+        self._force_no_fused_attn = False
 
-        # Instead of a combined QKV projection, we have separate Q and KV projections
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         
-        # We'll use a dynamic projection layer that can handle any context dimension
-        self.context_proj = None
-        self.context_dim = context_dim
+        self.context_dim = context_dim if context_dim is not None else dim
+        self.kv = nn.Linear(self.context_dim, dim * 2, bias=False)
         
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        
-        # KV projection will be created dynamically in forward pass if needed
-        self.kv = None
 
     def set_force_no_fused_attn(self, force_no_fused: bool):
         """Temporarily force disable fused attention for forward AD compatibility."""
@@ -210,27 +205,15 @@ class CrossAttention(nn.Module):
             context: Key/Value input of shape (B, M, C)
         """
         B, N, C = x.shape
-        M, context_dim = context.shape[1], context.shape[2]
+        M = context.shape[1]
 
-        # Project queries from x
         q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         
-        # Check if context dimension matches expected dimension
-        # If not, create a dynamic projection layer
-        if self.context_dim is None or context_dim != self.context_dim or self.kv is None:
-            # Update context_dim and recreate kv projection
-            self.context_dim = context_dim
-            # Create a new KV projection layer that matches the actual context dimension
-            self.kv = nn.Linear(self.context_dim, C * 2, bias=False).to(x.device)
-        
-        # Project keys and values from context
         kv = self.kv(context).reshape(B, M, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         k, v = kv.unbind(0)
 
-        # Apply normalization if specified
         q, k = self.q_norm(q), self.k_norm(k)
 
-        # Use fused attention only if both conditions are met
         use_fused = self.fused_attn and not self._force_no_fused_attn
         
         if use_fused:

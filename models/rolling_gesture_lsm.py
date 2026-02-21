@@ -5,51 +5,46 @@ import numpy as np
 from models.LSM import GestureLSM, sample_beta_distribution
 from loguru import logger
 
+
 def reshape_coefs(t):
-    """Reshape coefficients for broadcasting with 3D latent [B, T, D]."""
     return t.reshape((t.shape[0], 1, 1))
 
+
 class RollingGestureLSM(GestureLSM):
-    """流式GestureLSM模型，结合流匹配、滚动窗口机制和RDLA加速"""
-    
     def __init__(self, cfg):
         super().__init__(cfg)
         
         logger.info("Initializing RollingGestureLSM with RDLA")
         
-        # 滚动窗口参数
         self.window_size = cfg.model.get("window_size", 18)
         self.context_size = cfg.model.get("context_size", 4)
         self.noise_range = cfg.model.get("noise_range", [0, 1])
         
-        # RDLA 参数
         self.ladder_step = cfg.model.get("ladder_step", 1)
         self.inertia_weight = cfg.model.get("inertia_weight", 0.1)
         self.ofs_threshold = cfg.model.get("ofs_threshold", 0.8)
         
-        # Consistency Loss 参数
         self.consistency_ratio = cfg.model.get("consistency_ratio", 0.25)
         
-        # CFG 参数
         self.cond_drop_prob = cfg.model.get("cond_drop_prob", 0.1)
         
-        # 窗口和上下文缓冲区
+        self.context_noise_prob = cfg.model.get("context_noise_prob", 0.3)
+        self.max_context_noise = cfg.model.get("max_context_noise", 0.1)
+        
         self.window_buffer = None
         self.context_buffer = None
         
-        # 验证阶梯步长与窗口大小的兼容性
         if self.window_size % self.ladder_step != 0:
             logger.warning(f"window_size ({self.window_size}) should be divisible by ladder_step ({self.ladder_step})")
     
     def init_rolling_window(self, batch_size, device, idle_pose=None):
-        """初始化滚动窗口"""
         self.window_buffer = torch.randn(
             batch_size, self.window_size, self.input_dim * self.num_joints,
             device=device
         )
         
         if idle_pose is not None:
-            self.context_buffer = idle_pose.unsqueeze(0).repeat(batch_size, 1, 1)
+            self.context_buffer = idle_pose
         else:
             self.context_buffer = torch.randn(
                 batch_size, self.context_size, self.input_dim * self.num_joints,
@@ -57,14 +52,12 @@ class RollingGestureLSM(GestureLSM):
             ) * 0.001
     
     def apply_rolling_noise(self, x0, batch_size, device, use_ladder=True):
-        """应用滚动噪声调度到窗口，支持阶梯式噪声（RDLA）"""
         if use_ladder and self.ladder_step > 1:
             return self._apply_ladder_noise(x0, batch_size, device)
         else:
             return self._apply_linear_noise(x0, batch_size, device)
     
     def _apply_linear_noise(self, x0, batch_size, device):
-        """线性噪声调度（标准滚动扩散）"""
         t_0 = torch.rand(batch_size, device=device) * 0.09 + 0.01
         
         t_values = []
@@ -79,7 +72,6 @@ class RollingGestureLSM(GestureLSM):
         return x_t, t_values, noise
     
     def _apply_ladder_noise(self, x0, batch_size, device):
-        """阶梯式噪声调度（RDLA）"""
         l = self.ladder_step
         N = self.window_size
         num_ladders = N // l
@@ -102,22 +94,46 @@ class RollingGestureLSM(GestureLSM):
         return x_t, t_values, noise
     
     def apply_conditional_dropout(self, at_feat, cond_drop_prob=None):
-        """应用条件dropout用于CFG训练"""
         if cond_drop_prob is None:
             cond_drop_prob = self.cond_drop_prob
         
         batch_size = at_feat.shape[0]
         keep_mask = torch.rand(batch_size, device=at_feat.device) > cond_drop_prob
         
-        null_cond_embed = self.denoiser.get_null_cond_embed(at_feat.shape[-1], at_feat.device)
+        target_seq_len = at_feat.shape[1]
+        target_feat_dim = at_feat.shape[2]
+        null_cond_embed = self.denoiser.get_null_cond_embed(target_feat_dim, at_feat.device)
+        
+        # Adjust null_cond_embed sequence length to match at_feat
+        null_seq_len = null_cond_embed.shape[0]
+        if null_seq_len != target_seq_len:
+            if null_seq_len > target_seq_len:
+                null_cond_embed = null_cond_embed[:target_seq_len, :]
+            else:
+                repeats = (target_seq_len + null_seq_len - 1) // null_seq_len
+                null_cond_embed = null_cond_embed.repeat(repeats, 1)[:target_seq_len, :]
         
         at_feat_dropped = at_feat.clone()
         at_feat_dropped[~keep_mask] = null_cond_embed.unsqueeze(0).expand((~keep_mask).sum(), -1, -1)
         
         return at_feat_dropped
     
+    def apply_context_noise(self, context_latents):
+        if not self.training:
+            return context_latents
+        
+        batch_size = context_latents.shape[0]
+        noise_mask = torch.rand(batch_size, device=context_latents.device) < self.context_noise_prob
+        
+        if noise_mask.any():
+            noise_scale = torch.rand(batch_size, device=context_latents.device) * self.max_context_noise
+            noise_scale = noise_scale.unsqueeze(1).unsqueeze(2)
+            noise = torch.randn_like(context_latents) * noise_scale
+            context_latents = context_latents + noise * noise_mask.unsqueeze(1).unsqueeze(2).float()
+        
+        return context_latents
+    
     def compute_inertia_loss(self, pred, target):
-        """计算惯性损失，惩罚相邻帧的突变"""
         if self.inertia_weight <= 0:
             return torch.tensor(0.0, device=pred.device)
         
@@ -133,12 +149,15 @@ class RollingGestureLSM(GestureLSM):
         return inertia_loss
     
     def roll_window(self, new_frame, step=1):
-        """窗口平移：丢弃首帧，添加新帧
+        if new_frame.dim() == 2:
+            new_frame = new_frame.unsqueeze(1)
         
-        Args:
-            new_frame: 如果 step=1, shape=[B, D]; 如果 step>1, shape=[B, step, D]
-            step: 平移步数
-        """
+        self.window_buffer = torch.cat([
+            self.window_buffer[:, step:, :],
+            new_frame
+        ], dim=1)
+    
+    def roll_window_with_context(self, new_frame, step=1):
         if new_frame.dim() == 2:
             new_frame = new_frame.unsqueeze(1)
         
@@ -153,7 +172,6 @@ class RollingGestureLSM(GestureLSM):
         ], dim=1)
     
     def apply_ofs_smoothing(self, frames, threshold=None):
-        """OFS即时平滑策略"""
         if threshold is None:
             threshold = self.ofs_threshold
         
@@ -174,8 +192,14 @@ class RollingGestureLSM(GestureLSM):
         
         return smoothed
     
-    def train_forward(self, condition_dict, latents):
-        """滚动窗口训练前向传播，融合Consistency Loss和惯性损失"""
+    def train_forward(self, condition_dict, latents, train_consistency=False):
+        # 兼容两种形状的 latents:
+        # - 4D: [batch, feat, 1, seq] (来自 beat 数据集调用方式)
+        # - 3D: [batch, seq, feat] (原始 rolling_gesture_lsm 调用方式)
+        if latents.dim() == 4:
+            # 4D 转 3D: [B, D, 1, T] → [B, T, D]
+            latents = latents.squeeze(2).permute(0, 2, 1)
+        
         batch_size, seq_len, latent_dim = latents.shape
         device = latents.device
         
@@ -183,17 +207,8 @@ class RollingGestureLSM(GestureLSM):
         
         flow_batch_size = int(batch_size * (1 - self.consistency_ratio))
         
-        max_start = seq_len - self.window_size - self.context_size
-        if max_start <= 0:
-            j = 0
-        else:
-            j = torch.randint(0, max_start, (1,)).item()
-        
-        window_start = j + self.context_size
-        window_end = window_start + self.window_size
-        window_latents = latents[:, window_start:window_end, :]
-        
-        context_latents = latents[:, j:j+self.context_size, :]
+        seed = condition_dict['y']['seed']
+        pre_frames = seed.shape[1]
         
         audio_features = self.modality_encoder(
             condition_dict['y']['audio_onset'],
@@ -206,55 +221,80 @@ class RollingGestureLSM(GestureLSM):
             id_emb_expanded = id_emb.unsqueeze(1).repeat(1, audio_features.shape[1], 1)
             audio_features = torch.cat([audio_features, id_emb_expanded], dim=-1)
         
-        audio_features_flow = self.apply_conditional_dropout(audio_features[:flow_batch_size])
+        window_starts = list(range(pre_frames, seq_len - self.window_size + 1, self.ladder_step))
+        if len(window_starts) == 0:
+            window_starts = [pre_frames]
         
-        x_t, t_values, noise = self.apply_rolling_noise(
-            window_latents, batch_size, device, use_ladder=True
-        )
+        total_flow_loss = 0.0
+        total_inertia_loss = 0.0
+        total_consistency_loss = 0.0
+        num_windows = len(window_starts)
         
-        full_input = torch.cat([context_latents, x_t], dim=1)
-        
-        full_input_4d = full_input.reshape(batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
-        model_output = self.denoiser(
-            x=full_input_4d[:flow_batch_size],
-            timesteps=t_values[:flow_batch_size, 0],
-            seed=condition_dict['y']['seed'][:flow_batch_size],
-            at_feat=audio_features_flow
-        )
-        model_output = model_output.permute(0, 3, 1, 2).reshape(flow_batch_size, -1, self.num_joints * self.input_dim)
-        
-        if self.flow_mode == "v":
-            target = window_latents[:flow_batch_size] - noise[:flow_batch_size]
-        else:
-            target = window_latents[:flow_batch_size]
-        
-        window_output = model_output[:, self.context_size:, :]
-        
-        flow_loss = F.mse_loss(window_output, target)
-        
-        inertia_loss = self.compute_inertia_loss(window_output, target)
-        
-        losses["flow_loss"] = flow_loss
-        losses["inertia_loss"] = inertia_loss
-        
-        if flow_batch_size < batch_size:
-            consistency_loss = self._compute_consistency_loss(
-                condition_dict, latents, audio_features, batch_size, flow_batch_size,
-                device, j, window_start, window_end
+        for window_start in window_starts:
+            window_end = window_start + self.window_size
+            
+            if window_end > seq_len:
+                window_end = seq_len
+                window_start = max(pre_frames, window_end - self.window_size)
+            
+            window_latents = latents[:, window_start:window_end, :]
+            
+            context_latents = latents[:, max(0, window_start - self.context_size):window_start, :]
+            if context_latents.shape[1] < self.context_size:
+                padding = torch.zeros(batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
+                context_latents = torch.cat([padding, context_latents], dim=1)
+            context_latents = self.apply_context_noise(context_latents)
+            
+            audio_features_flow = self.apply_conditional_dropout(audio_features[:flow_batch_size])
+            
+            x_t, t_values, noise = self.apply_rolling_noise(
+                window_latents, batch_size, device, use_ladder=True
             )
-            losses["consistency_loss"] = consistency_loss
-        else:
-            consistency_loss = torch.tensor(0.0, device=device)
+            
+            full_input = torch.cat([context_latents, x_t], dim=1)
+            
+            full_input_4d = full_input.reshape(batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
+            model_output = self.denoiser(
+                x=full_input_4d[:flow_batch_size],
+                timesteps=t_values[:flow_batch_size, 0],
+                seed=condition_dict['y']['seed'][:flow_batch_size],
+                at_feat=audio_features_flow
+            )
+            model_output = model_output.permute(0, 3, 1, 2).reshape(flow_batch_size, -1, self.num_joints * self.input_dim)
+            
+            if self.flow_mode == "v":
+                target = window_latents[:flow_batch_size] - noise[:flow_batch_size]
+            else:
+                target = window_latents[:flow_batch_size]
+            
+            window_output = model_output[:, self.context_size:, :]
+            
+            # Use direct MSE loss (same as interactive_gesture_lsm.py)
+            flow_loss = F.mse_loss(window_output, target)
+            inertia_loss = self.compute_inertia_loss(window_output, target)
+            
+            total_flow_loss += flow_loss
+            total_inertia_loss += inertia_loss
+            
+            if flow_batch_size < batch_size:
+                consistency_loss = self._compute_consistency_loss(
+                    condition_dict, latents, audio_features, batch_size, flow_batch_size,
+                    device, window_start, window_end
+                )
+                total_consistency_loss += consistency_loss
         
-        total_loss = flow_loss + inertia_loss + consistency_loss
+        losses["flow_loss"] = total_flow_loss / num_windows
+        losses["inertia_loss"] = total_inertia_loss / num_windows
+        losses["consistency_loss"] = total_consistency_loss / num_windows
+        
+        total_loss = losses["flow_loss"] + losses["inertia_loss"] + losses["consistency_loss"]
         losses["loss"] = total_loss
         
         return losses
     
     def _compute_consistency_loss(self, condition_dict, latents, audio_features, 
-                                   batch_size, flow_batch_size, device, j, 
+                                   batch_size, flow_batch_size, device, 
                                    window_start, window_end):
-        """计算Consistency Loss"""
         cons_start = flow_batch_size
         cons_batch_size = batch_size - flow_batch_size
         
@@ -262,9 +302,15 @@ class RollingGestureLSM(GestureLSM):
             return torch.tensor(0.0, device=device)
         
         window_latents = latents[cons_start:, window_start:window_end, :]
-        context_latents = latents[cons_start:, j:j+self.context_size, :]
+        latent_dim = window_latents.shape[-1]
         
-        seed_vectors = condition_dict['y']['seed'][cons_start:]
+        context_latents = latents[cons_start:, max(0, window_start - self.context_size):window_start, :]
+        if context_latents.shape[1] < self.context_size:
+            padding = torch.zeros(cons_batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
+            context_latents = torch.cat([padding, context_latents], dim=1)
+        context_latents = self.apply_context_noise(context_latents)
+        
+        seed = condition_dict['y']['seed'][cons_start:]
         
         deltas = 1 / torch.tensor([2 ** i for i in range(1, 8)]).to(device)
         delta_probs = torch.ones((deltas.shape[0],), device=device) / deltas.shape[0]
@@ -286,7 +332,7 @@ class RollingGestureLSM(GestureLSM):
             pred_t = self.denoiser(
                 x=full_input_4d,
                 timesteps=t,
-                seed=seed_vectors,
+                seed=seed,
                 at_feat=audio_features_cons,
                 cond_time=d
             )
@@ -307,7 +353,7 @@ class RollingGestureLSM(GestureLSM):
             pred_td = self.denoiser(
                 x=full_input_td_4d,
                 timesteps=t + d,
-                seed=seed_vectors,
+                seed=seed,
                 at_feat=audio_features_cons,
                 cond_time=d
             )
@@ -325,7 +371,7 @@ class RollingGestureLSM(GestureLSM):
         model_pred = self.denoiser(
             x=full_input_4d,
             timesteps=t,
-            seed=seed_vectors,
+            seed=seed,
             at_feat=audio_features_cons,
             cond_time=2 * d
         )
@@ -342,9 +388,19 @@ class RollingGestureLSM(GestureLSM):
         return consistency_loss
     
     def _apply_force_cfg(self, at_feat, force_cfg):
-        """应用强制CFG"""
         batch_size = at_feat.shape[0]
-        null_cond_embed = self.denoiser.get_null_cond_embed(at_feat.shape[-1], at_feat.device)
+        target_seq_len = at_feat.shape[1]
+        target_feat_dim = at_feat.shape[2]
+        null_cond_embed = self.denoiser.get_null_cond_embed(target_feat_dim, at_feat.device)
+        
+        # Adjust null_cond_embed sequence length to match at_feat
+        null_seq_len = null_cond_embed.shape[0]
+        if null_seq_len != target_seq_len:
+            if null_seq_len > target_seq_len:
+                null_cond_embed = null_cond_embed[:target_seq_len, :]
+            else:
+                repeats = (target_seq_len + null_seq_len - 1) // null_seq_len
+                null_cond_embed = null_cond_embed.repeat(repeats, 1)[:target_seq_len, :]
         
         at_feat_forced = at_feat.clone()
         force_cfg_tensor = torch.tensor(force_cfg, device=at_feat.device)
@@ -356,14 +412,13 @@ class RollingGestureLSM(GestureLSM):
     @torch.no_grad()
     def generate(self, condition_dict, audio_features, 
                  num_steps=2, guidance_scale=2.0):
-        """流式生成，支持阶梯式加速和OFS平滑"""
         batch_size = audio_features.shape[0]
         device = audio_features.device
         
-        self.init_rolling_window(batch_size, device)
+        seed = condition_dict['y']['seed']
+        self.init_rolling_window(batch_size, device, idle_pose=seed)
         
         epsilon = 1e-8
-        delta_t = 1.0 / num_steps
         timesteps = torch.linspace(epsilon, 1 - epsilon, num_steps + 1, device=device)
         
         generated_sequence = []
@@ -371,7 +426,12 @@ class RollingGestureLSM(GestureLSM):
         
         l = self.ladder_step
         
-        frame_idx = 0
+        pre_frames = condition_dict['y']['seed'].shape[1]
+        
+        for i in range(pre_frames):
+            generated_sequence.append(seed[:, i, :])
+        
+        frame_idx = pre_frames
         while frame_idx < total_frames:
             frames_to_generate = min(l, total_frames - frame_idx)
             
@@ -392,6 +452,7 @@ class RollingGestureLSM(GestureLSM):
                         audio_features, frame_idx, frames_to_generate, guidance_scale
                     )
                 else:
+                    # Use local audio features for current window
                     at_feat = audio_features[:, frame_idx:frame_idx+frames_to_generate, :]
                     if at_feat.shape[1] == 0:
                         at_feat = audio_features[:, frame_idx:frame_idx+1, :]
@@ -417,28 +478,100 @@ class RollingGestureLSM(GestureLSM):
             for i in range(frames_to_generate):
                 generated_sequence.append(output_frames[:, i, :])
             
-            new_frames = torch.randn(batch_size, frames_to_generate, self.input_dim * self.num_joints, device=device)
-            self.roll_window(new_frames, step=frames_to_generate)
+            self.context_buffer = torch.cat([
+                self.context_buffer[:, frames_to_generate:, :],
+                output_frames
+            ], dim=1)
+            
+            self.window_buffer = torch.randn(
+                batch_size, self.window_size, self.input_dim * self.num_joints, device=device
+            )
             
             frame_idx += frames_to_generate
         
         generated_sequence = torch.stack(generated_sequence, dim=1)
         return generated_sequence
     
+    def forward(self, condition_dict):
+        """Forward pass for inference (compatible with GestureLSM interface).
+        
+        Args:
+            condition_dict: Dictionary containing input conditions
+            
+        Returns:
+            Dictionary containing generated latents (compatible with GestureLSM output)
+        """
+        # Extract input features
+        audio = condition_dict['y']['audio_onset']
+        word_tokens = condition_dict['y']['word']
+        ids = condition_dict['y']['id']
+        seed_vectors = condition_dict['y']['seed']
+        style_features = condition_dict['y'].get('style_feature', None)
+        
+        return_dict = {}
+        return_dict['seed'] = seed_vectors
+        
+        # Encode input modalities
+        audio_features = self.modality_encoder(audio, word_tokens)
+        
+        # Process ID information if enabled
+        if self.use_id and ids is not None:
+            # Get the first frame's ID from the sequence
+            if len(ids.shape) > 1:
+                first_frame_id = ids[:, 0]
+                if len(first_frame_id.shape) > 1:
+                    first_frame_id = torch.argmax(first_frame_id, dim=-1)
+            else:
+                first_frame_id = ids
+            
+            id_idx = torch.clamp(first_frame_id, 0, self.max_id - 1).long()
+            id_emb = self.id_embeddings(id_idx)
+            id_emb_expanded = id_emb.unsqueeze(1).repeat(1, audio_features.shape[1], 1)
+            audio_features = torch.cat([audio_features, id_emb_expanded], dim=-1)
+        
+        return_dict['at_feat'] = audio_features
+        
+        # Generate using the generate method
+        generated_latents = self.generate(
+            condition_dict=condition_dict,
+            audio_features=audio_features,
+            num_steps=self.cfg.model.n_steps,
+            guidance_scale=self.cfg.model.guidance_scale
+        )
+        
+        # Reshape to match GestureLSM's output format: [batch, feat, 1, seq]
+        # from [batch, seq, feat]
+        batch_size, seq_len, feat_dim = generated_latents.shape
+        generated_latents_4d = generated_latents.permute(0, 2, 1).unsqueeze(2)
+        
+        return_dict['latents'] = generated_latents_4d
+        return return_dict
+    
     def _guided_denoise(self, x, t, condition_dict, audio_features, frame_idx, frames_to_generate, guidance_scale):
-        """带CFG的去噪"""
         batch_size = x.shape[0]
         
         x_doubled = torch.cat([x] * 2, dim=0)
         seed_doubled = torch.cat([condition_dict['y']['seed']] * 2, dim=0)
         
+        # Use local audio features for current window
         at_feat = audio_features[:, frame_idx:frame_idx+frames_to_generate, :]
         if at_feat.shape[1] == 0:
             at_feat = audio_features[:, frame_idx:frame_idx+1, :]
         
-        null_cond_embed = self.denoiser.get_null_cond_embed(at_feat.shape[-1], at_feat.device)
+        target_feat_dim = at_feat.shape[2]
+        null_cond_embed = self.denoiser.get_null_cond_embed(target_feat_dim, at_feat.device)
         
-        at_feat_uncond = null_cond_embed[:at_feat.shape[1], :].unsqueeze(0).expand(batch_size, -1, -1)
+        # Adjust null_cond_embed sequence length to match at_feat
+        target_seq_len = at_feat.shape[1]
+        null_seq_len = null_cond_embed.shape[0]
+        if null_seq_len != target_seq_len:
+            if null_seq_len > target_seq_len:
+                null_cond_embed = null_cond_embed[:target_seq_len, :]
+            else:
+                repeats = (target_seq_len + null_seq_len - 1) // null_seq_len
+                null_cond_embed = null_cond_embed.repeat(repeats, 1)[:target_seq_len, :]
+        
+        at_feat_uncond = null_cond_embed.unsqueeze(0).expand(batch_size, -1, -1)
         
         at_feat_combined = torch.cat([at_feat, at_feat_uncond], dim=0)
         

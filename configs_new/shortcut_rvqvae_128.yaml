@@ -1,15 +1,15 @@
 wandb_project: 'GestureLSM'
-exp_name: 'shortcut_rvqvae_128_mfcc_1'
+exp_name: 'shortcut_rvqvae_128_mfcc_v4'
 
 wandb_entity: 'xxxx'
 wandb_key: "xxxxxxx"
 wandb_log_dir: './outputs/wandb'
 output_dir: ./outputs/weights
-log_period: 10
-val_period: 20
-gpus: [0,1,2,3]
+log_period: 50
+val_period: 10
+gpus: [0] #[0,1,2,3]
 seed: 42 #42
-ddp: true
+ddp: false #true
 debug: false
 
 vqvae_upper_path: ./ckpt/net_300000_upper.pth
@@ -35,7 +35,7 @@ std_trans_path: "./mean_std/beatx_2_trans_std.npy"
 data:
   name_pyfile: "dataloaders.beat_sep_lower"
   class_name: "CustomDataset"
-  train_bs: 128
+  train_bs: 256 #128
   multi_length_training: [1.0]
   root_path: ./
   beat_align: True
@@ -56,7 +56,7 @@ data:
   data_path: ./datasets/BEAT_SMPL/beat_v2.0.0/beat_english_v2.0.0/
   training_speakers: [2] # [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 27, 28, 30] # [2]
   additional_data: False
-  cache_path: ./datasets/beat_cache/beat_smplx_en_emage_6_128_mfcc/
+  cache_path: ./datasets/beat_cache/beat_smplx_en_emage_2_128_mfcc/
   new_cache: False
   disable_filtering: False
   clean_first_seconds: 0
@@ -73,8 +73,10 @@ data:
   onset_rep: True
 
 model:
-  model_name: LSM
-  g_name: GestureLSM
+  model_name: rolling_gesture_lsm
+  g_name: RollingGestureLSM
+  # model_name: LSM
+  # g_name: GestureLSM
   do_classifier_free_guidance: True #False
   guidance_scale: 2 #2
   n_steps: 2
@@ -83,6 +85,21 @@ model:
   use_id: false
   max_id: 100  # 预留足够的ID空间
   id_embedding_dim: 256  # 与denoiser潜在维度保持一致
+  # 滚动窗口配置
+  window_size: 16
+  context_size: 4
+  noise_range: [0, 1]
+  # RDLA 阶梯加速配置
+  ladder_step: 4  # 阶梯步长，1为标准滚动，2/4/8为加速模式
+  inertia_weight: 0.5  # 惯性损失权重，惩罚相邻帧突变
+  ofs_threshold: 0.8  # OFS平滑阈值，低于此值触发平滑
+  # Consistency Loss 配置
+  consistency_ratio: 0.25  # consistency batch比例
+  # CFG 配置
+  cond_drop_prob: 0.1  # 条件dropout概率
+  # 上下文噪声配置
+  context_noise_prob: 0.3
+  max_context_noise: 0.01
 
   denoiser:
     target: models.denoiser.GestureDenoiser
@@ -103,6 +120,8 @@ model:
       # Add ID-related parameters
       use_id: ${model.use_id}
       id_embedding_dim: ${model.id_embedding_dim}
+      # Critical: must match audio feature dimension (256 from modality_encoder)
+      cross_attn_context_dim: 256
   
   modality_encoder:
     target: models.layers.modality_encoder.ModalityEncoder
@@ -125,23 +144,23 @@ validation:
   validation_steps: 1000
 
 solver:
-  opt: 'adam'
+  opt: 'adamw'
   epochs: 1000 #1000
   grad_norm: 1.0
   momentum: 0.8
   nesterov: True
   amsgrad: False
   
-  # lr
-  lr_base: 1e-5 #2e-4
+  # lr - use lower learning rate for stability (same as interactive_gesture_lsm)
+  lr_base: 1e-5
   lr_policy: 'step'
   decay_rate: 0.1
   lr_warmup_steps: 50
   decay_epochs: 500
   warmup_epochs: 100 #0
-  warmup_lr: 1e-6 #5e-4
+  warmup_lr: 1e-6
   lr_min: 1e-7
-  weight_decay: 0.0
+  weight_decay: 1e-3
   opt_betas: [0.5, 0.999]
   # Early stopping configuration
   early_stopping:
