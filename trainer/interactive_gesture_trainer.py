@@ -94,6 +94,9 @@ class InteractiveGestureTrainer:
             ["fgd", "l1div", "predict_x0_loss"],
             [True, True, True],
         )
+        
+        self.inference_mode = getattr(cfg.model, "inference_mode", "rdla")
+        logger.info(f"Inference mode: {self.inference_mode}")
 
         self._init_dataloaders()
         self._init_model()
@@ -708,13 +711,20 @@ class InteractiveGestureTrainer:
                         loaded_data["listener_latents"],
                         context_size=self.model.module.context_size
                     )
-                    generated_latents = self.model.module.generate_online(
-                        condition_dict=condition_dict,
-                        audio_features=audio_features,
-                        listener_loader=listener_loader,
-                        num_steps=self.cfg.model.n_steps,
-                        guidance_scale=self.cfg.model.guidance_scale
-                    )
+                    if self.inference_mode == "rflav":
+                        generated_latents = self.model.module.generate_online_rflav(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale
+                        )
+                    else:
+                        generated_latents = self.model.module.generate_online_rdla(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale
+                        )
                 else:
                     audio_features = self.model.modality_encoder(
                         loaded_data["audio_onset"],
@@ -724,13 +734,20 @@ class InteractiveGestureTrainer:
                         loaded_data["listener_latents"],
                         context_size=self.model.context_size
                     )
-                    generated_latents = self.model.generate_online(
-                        condition_dict=condition_dict,
-                        audio_features=audio_features,
-                        listener_loader=listener_loader,
-                        num_steps=self.cfg.model.n_steps,
-                        guidance_scale=self.cfg.model.guidance_scale
-                    )
+                    if self.inference_mode == "rflav":
+                        generated_latents = self.model.generate_online_rflav(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale
+                        )
+                    else:
+                        generated_latents = self.model.generate_online_rdla(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale
+                        )
 
                 bs, n_latent = loaded_data["speaker_latents"].shape[0], loaded_data["speaker_latents"].shape[1]
                 pre_frames = self.cfg.pre_frames
@@ -838,13 +855,20 @@ class InteractiveGestureTrainer:
                         loaded_data["listener_latents"],
                         context_size=self.model.module.context_size
                     )
-                    generated_latents = self.model.module.generate_online(
-                        condition_dict=condition_dict,
-                        audio_features=audio_features,
-                        listener_loader=listener_loader,
-                        num_steps=self.cfg.model.n_steps,
-                        guidance_scale=self.cfg.model.guidance_scale
-                    )
+                    if self.inference_mode == "rflav":
+                        generated_latents = self.model.module.generate_online_rflav(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale
+                        )
+                    else:
+                        generated_latents = self.model.module.generate_online_rdla(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale
+                        )
                 else:
                     audio_features = self.model.modality_encoder(
                         loaded_data["audio_onset"],
@@ -854,13 +878,20 @@ class InteractiveGestureTrainer:
                         loaded_data["listener_latents"],
                         context_size=self.model.context_size
                     )
-                    generated_latents = self.model.generate_online(
-                        condition_dict=condition_dict,
-                        audio_features=audio_features,
-                        listener_loader=listener_loader,
-                        num_steps=self.cfg.model.n_steps,
-                        guidance_scale=self.cfg.model.guidance_scale
-                    )
+                    if self.inference_mode == "rflav":
+                        generated_latents = self.model.generate_online_rflav(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale
+                        )
+                    else:
+                        generated_latents = self.model.generate_online_rdla(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale
+                        )
 
                 bs, n_latent = loaded_data["speaker_latents"].shape[0], loaded_data["speaker_latents"].shape[1]
                 pre_frames = self.cfg.pre_frames
