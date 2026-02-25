@@ -20,25 +20,20 @@ class ExactLengthAdjuster(nn.Module):
         super(ExactLengthAdjuster, self).__init__()
         self.target_length = target_length
     
-    def forward(self, x):
-        # x is expected to be [batch, channels, time]
+    def forward(self, x, target_length=None):
+        if target_length is None:
+            target_length = self.target_length
         current_length = x.shape[2]
         
-        if current_length == self.target_length:
+        if current_length == target_length:
             return x
-        elif current_length < self.target_length:
-            # Need to add frames
-            frames_to_add = self.target_length - current_length
-            
-            # Duplicate the last frame as many times as needed
+        elif current_length < target_length:
+            frames_to_add = target_length - current_length
             last_frame = x[:, :, -1:]
             extra_frames = last_frame.repeat(1, 1, frames_to_add)
-            
             return torch.cat([x, extra_frames], dim=2)
         else:
-            # Need to remove frames
-            # Just truncate to the target length
-            return x[:, :, :self.target_length]
+            return x[:, :, :target_length]
 
 
 class WavEncoder(nn.Module):
@@ -55,13 +50,13 @@ class WavEncoder(nn.Module):
             )
         self.length_adjuster = ExactLengthAdjuster(target_length=target_length)
     
-    def forward(self, wav_data):
+    def forward(self, wav_data, target_length=None):
         if wav_data.dim() == 2:
             wav_data = wav_data.unsqueeze(1) 
         else:
             wav_data = wav_data.transpose(1, 2)
         out = self.feat_extractor(wav_data)
-        out = self.length_adjuster(out)
+        out = self.length_adjuster(out, target_length)
         
         return out.transpose(1, 2)
 
@@ -77,6 +72,7 @@ class ModalityEncoder(nn.Module):
                  audio_fps=30,
                  use_exp=False,
                  target_length=256,
+                 val_target_length=None,
                  spatial_temporal=False,
                  vocab_path=None
                  ):
@@ -85,12 +81,12 @@ class ModalityEncoder(nn.Module):
         self.raw_audio = raw_audio
         self.latent_dim = latent_dim
         self.audio_fps = audio_fps
+        self.val_target_length = val_target_length if val_target_length is not None else target_length
         
 
         self.WavEncoder = WavEncoder(audio_dim, audio_in=audio_in, target_length=target_length)
         self.text_encoder_body = nn.Linear(300, audio_dim) 
 
-        # Use provided vocab_path or default to data_path/weights/vocab.pkl
         if vocab_path is None:
             vocab_path = f"{data_path}weights/vocab.pkl"
         with open(vocab_path, 'rb') as f:
@@ -115,41 +111,34 @@ class ModalityEncoder(nn.Module):
             else:
                 self.mix_audio_text = nn.Linear(audio_dim*2, self.latent_dim * (3 if spatial_temporal else 1))
     
-    def forward(self, audio, word, raw_audio=None, squeeze_scale=4):
-        # Initial features extraction - single transpose each
-        # [B, T, D] -> [T, B, D]
-        audio_feat = self.WavEncoder(audio)
-        # Clamp word indices to valid vocabulary range
+    def forward(self, audio, word, raw_audio=None, squeeze_scale=4, target_length=None):
+        audio_feat = self.WavEncoder(audio, target_length)
         word_clamped = torch.clamp(word, 0, self.text_pre_encoder_body.num_embeddings - 1)
         text_feat = self.text_encoder_body(self.text_pre_encoder_body(word_clamped))
         if raw_audio is not None and self.raw_audio:
-            # Keep the same transpose pattern for consistency
-            # raw_feat = self.extract_wavlm_feats(raw_audio)
             raw_feat = self.audio_projection(raw_audio)
             
             at_feat = torch.cat([audio_feat, raw_feat, text_feat], dim=2)
         else:
-            # 对齐 audio_feat 和 text_feat 的时间维度
-            audio_len = audio_feat.shape[1]  # 目标长度
+            audio_len = audio_feat.shape[1]
             text_len = text_feat.shape[1]
             
             if text_len != audio_len:
-                # 使用插值对齐文本特征到音频特征长度
                 text_feat_aligned = F.interpolate(
-                    text_feat.transpose(1, 2),  # [B, D, T]
+                    text_feat.transpose(1, 2),
                     size=audio_len,
                     mode='linear',
                     align_corners=True
-                ).transpose(1, 2)  # [B, T, D]
+                ).transpose(1, 2)
             else:
                 text_feat_aligned = text_feat
             
-            at_feat = torch.cat([audio_feat, text_feat_aligned], dim=2)  # [B, T, D]
+            at_feat = torch.cat([audio_feat, text_feat_aligned], dim=2)
         
-        at_feat = self.mix_audio_text(at_feat)  # [B, T, D']
+        at_feat = self.mix_audio_text(at_feat)
         
         at_feat = F.avg_pool1d(at_feat.transpose(1, 2), squeeze_scale)
-        at_feat = at_feat.transpose(1, 2) # [B, T/scale, D']
+        at_feat = at_feat.transpose(1, 2)
         return at_feat
 
     @torch.no_grad()

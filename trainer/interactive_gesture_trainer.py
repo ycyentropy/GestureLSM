@@ -703,9 +703,12 @@ class InteractiveGestureTrainer:
                 }
 
                 if self.cfg.ddp:
+                    val_target_length = getattr(self.cfg.model.modality_encoder.params, 'val_target_length', 
+                                                self.cfg.model.modality_encoder.params.get('val_target_length', None))
                     audio_features = self.model.module.modality_encoder(
                         loaded_data["audio_onset"],
-                        loaded_data["word"]
+                        loaded_data["word"],
+                        target_length=val_target_length
                     )
                     listener_loader = OnlineListenerLoader(
                         loaded_data["listener_latents"],
@@ -726,9 +729,12 @@ class InteractiveGestureTrainer:
                             guidance_scale=self.cfg.model.guidance_scale
                         )
                 else:
+                    val_target_length = getattr(self.cfg.model.modality_encoder.params, 'val_target_length',
+                                                self.cfg.model.modality_encoder.params.get('val_target_length', None))
                     audio_features = self.model.modality_encoder(
                         loaded_data["audio_onset"],
-                        loaded_data["word"]
+                        loaded_data["word"],
+                        target_length=val_target_length
                     )
                     listener_loader = OnlineListenerLoader(
                         loaded_data["listener_latents"],
@@ -847,9 +853,12 @@ class InteractiveGestureTrainer:
                 }
 
                 if self.cfg.ddp:
+                    val_target_length = getattr(self.cfg.model.modality_encoder.params, 'val_target_length', 
+                                                self.cfg.model.modality_encoder.params.get('val_target_length', None))
                     audio_features = self.model.module.modality_encoder(
                         loaded_data["audio_onset"],
-                        loaded_data["word"]
+                        loaded_data["word"],
+                        target_length=val_target_length
                     )
                     listener_loader = OnlineListenerLoader(
                         loaded_data["listener_latents"],
@@ -870,9 +879,12 @@ class InteractiveGestureTrainer:
                             guidance_scale=self.cfg.model.guidance_scale
                         )
                 else:
+                    val_target_length = getattr(self.cfg.model.modality_encoder.params, 'val_target_length',
+                                                self.cfg.model.modality_encoder.params.get('val_target_length', None))
                     audio_features = self.model.modality_encoder(
                         loaded_data["audio_onset"],
-                        loaded_data["word"]
+                        loaded_data["word"],
+                        target_length=val_target_length
                     )
                     listener_loader = OnlineListenerLoader(
                         loaded_data["listener_latents"],

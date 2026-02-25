@@ -71,7 +71,8 @@ def load_model(cfg, checkpoint_path=None):
 
 def pose_to_latent(pose_data, trans_v, vq_upper, vq_hands, vq_lower, 
                     mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                    joint_mask_upper, joint_mask_lower, use_trans=True):
+                    joint_mask_upper, joint_mask_lower, use_trans=True, vqvae_latent_scale=5,
+                    train_body_part=None):
     bs, n = pose_data.shape[0], pose_data.shape[1]
     
     tar_pose_hands = pose_data[:, :, 25 * 3 : 55 * 3]
@@ -90,11 +91,9 @@ def pose_to_latent(pose_data, trans_v, vq_upper, vq_hands, vq_lower,
     tar_pose_upper = (tar_pose_upper - mean_upper) / (std_upper + 1e-8)
     tar_pose_lower = (tar_pose_leg - mean_lower) / (std_lower + 1e-8)
     
-    # 根据 use_trans 参数决定是否使用真实 translation
     if use_trans:
         tar_pose_lower = torch.cat([tar_pose_lower, trans_v], dim=-1)
     else:
-        # 使用零填充代替 translation，保持维度一致 (54 + 3 = 57)
         zero_trans = torch.zeros(bs, n, 3, device=pose_data.device, dtype=pose_data.dtype)
         tar_pose_lower = torch.cat([tar_pose_lower, zero_trans], dim=-1)
     
@@ -103,21 +102,48 @@ def pose_to_latent(pose_data, trans_v, vq_upper, vq_hands, vq_lower,
         latent_hands = vq_hands.map2latent(tar_pose_hands)
         latent_lower = vq_lower.map2latent(tar_pose_lower)
     
-    latent_in = torch.cat([latent_upper, latent_hands, latent_lower], dim=2) / 5
+    if train_body_part == "upper":
+        latent_hands = torch.zeros_like(latent_hands)
+        latent_lower = torch.zeros_like(latent_lower)
+    elif train_body_part == "hands":
+        latent_upper = torch.zeros_like(latent_upper)
+        latent_lower = torch.zeros_like(latent_lower)
+    elif train_body_part == "lower":
+        latent_upper = torch.zeros_like(latent_upper)
+        latent_hands = torch.zeros_like(latent_hands)
+    
+    latent_in = torch.cat([latent_upper, latent_hands, latent_lower], dim=2) / vqvae_latent_scale
     return latent_in
 
 
 def latent_to_pose(latents, vq_upper, vq_hands, vq_lower,
                    mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                   joint_mask_upper, joint_mask_lower, joint_mask_hands):
+                   joint_mask_upper, joint_mask_lower, joint_mask_hands, vqvae_latent_scale=5,
+                   gt_latents=None, train_body_part=None):
     from utils.rotation_conversions import rotation_6d_to_matrix, matrix_to_axis_angle, axis_angle_to_matrix, matrix_to_rotation_6d
     
-    latent_in = latents * 5
+    latent_in = latents * vqvae_latent_scale
     code_dim = vq_upper.code_dim
     
     latent_upper = latent_in[..., :code_dim]
     latent_hands = latent_in[..., code_dim:code_dim*2]
     latent_lower = latent_in[..., code_dim*2:code_dim*3]
+    
+    if gt_latents is not None and train_body_part is not None:
+        gt_latent_in = gt_latents * vqvae_latent_scale
+        gt_latent_upper = gt_latent_in[..., :code_dim]
+        gt_latent_hands = gt_latent_in[..., code_dim:code_dim*2]
+        gt_latent_lower = gt_latent_in[..., code_dim*2:code_dim*3]
+        
+        if train_body_part == "upper":
+            latent_hands = gt_latent_hands
+            latent_lower = gt_latent_lower
+        elif train_body_part == "hands":
+            latent_upper = gt_latent_upper
+            latent_lower = gt_latent_lower
+        elif train_body_part == "lower":
+            latent_upper = gt_latent_upper
+            latent_hands = gt_latent_hands
     
     rec_upper = vq_upper.latent2origin(latent_upper)[0]
     rec_hands = vq_hands.latent2origin(latent_hands)[0]
@@ -265,6 +291,10 @@ def main():
     logger.info("eval_copy model loaded")
     
     vae_test_len = 32
+    vqvae_latent_scale = cfg.get('vqvae_latent_scale', 5)
+    train_body_part = cfg.get('train_body_part', None)
+    if train_body_part:
+        logger.info(f"Training only body part: {train_body_part}")
     
     logger.info("Creating datasets...")
     train_dataset = DyadicFeedbackDataset(cfg, split='train', build_cache=True)
@@ -318,13 +348,15 @@ def main():
         speaker_latents = pose_to_latent(
             speaker_pose, speaker_trans_v, vq_upper, vq_hands, vq_lower,
             mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-            joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True)
+            joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+            vqvae_latent_scale=vqvae_latent_scale, train_body_part=train_body_part
         )
         
         listener_latents = pose_to_latent(
             listener_pose, listener_trans_v, vq_upper, vq_hands, vq_lower,
             mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-            joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True)
+            joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+            vqvae_latent_scale=vqvae_latent_scale, train_body_part=train_body_part
         )
         
         condition_dict = {
@@ -368,16 +400,25 @@ def main():
             listener_pose = batch_data['listener']['pose'].cuda()
             listener_trans_v = batch_data['listener']['trans_v'].cuda()
             
-            speaker_latents = pose_to_latent(
+            speaker_latents_full = pose_to_latent(
                 speaker_pose, speaker_trans_v, vq_upper, vq_hands, vq_lower,
                 mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True)
+                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+                vqvae_latent_scale=vqvae_latent_scale, train_body_part=None
+            )
+            
+            speaker_latents_seed = pose_to_latent(
+                speaker_pose, speaker_trans_v, vq_upper, vq_hands, vq_lower,
+                mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
+                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+                vqvae_latent_scale=vqvae_latent_scale, train_body_part=train_body_part
             )
             
             listener_latents = pose_to_latent(
                 listener_pose, listener_trans_v, vq_upper, vq_hands, vq_lower,
                 mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True)
+                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+                vqvae_latent_scale=vqvae_latent_scale, train_body_part=None
             )
             
             condition_dict = {
@@ -385,7 +426,7 @@ def main():
                     "audio_onset": batch_data['speaker']['audio'].cuda(),
                     "word": batch_data['speaker']['word'].cuda(),
                     "id": batch_data['speaker']['id'].cuda() if isinstance(batch_data['speaker']['id'], torch.Tensor) else torch.tensor([batch_data['speaker']['id']]).cuda(),
-                    "seed": speaker_latents[:, :cfg.get('pre_frames', 4)],
+                    "seed": speaker_latents_seed[:, :cfg.get('pre_frames', 4)],
                 }
             }
             
@@ -414,12 +455,15 @@ def main():
             rec_pose = latent_to_pose(
                 generated_latents, vq_upper, vq_hands, vq_lower,
                 mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                joint_mask_upper, joint_mask_lower, joint_mask_hands
+                joint_mask_upper, joint_mask_lower, joint_mask_hands,
+                vqvae_latent_scale=vqvae_latent_scale,
+                gt_latents=speaker_latents_full, train_body_part=train_body_part
             )
             tar_pose = latent_to_pose(
-                speaker_latents, vq_upper, vq_hands, vq_lower,
+                speaker_latents_full, vq_upper, vq_hands, vq_lower,
                 mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                joint_mask_upper, joint_mask_lower, joint_mask_hands
+                joint_mask_upper, joint_mask_lower, joint_mask_hands,
+                vqvae_latent_scale=vqvae_latent_scale
             )
             
             remain = n % vae_test_len
@@ -484,13 +528,15 @@ def main():
             speaker_latents = pose_to_latent(
                 speaker_pose, speaker_trans_v, vq_upper, vq_hands, vq_lower,
                 mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True)
+                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+                vqvae_latent_scale=vqvae_latent_scale, train_body_part=train_body_part
             )
             
             listener_latents = pose_to_latent(
                 listener_pose, listener_trans_v, vq_upper, vq_hands, vq_lower,
                 mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True)
+                joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+                vqvae_latent_scale=vqvae_latent_scale, train_body_part=train_body_part
             )
             
             condition_dict = {
@@ -561,16 +607,25 @@ def main():
                     listener_pose = batch_data['listener']['pose'].cuda()
                     listener_trans_v = batch_data['listener']['trans_v'].cuda()
                     
-                    speaker_latents = pose_to_latent(
+                    speaker_latents_full = pose_to_latent(
                         speaker_pose, speaker_trans_v, vq_upper, vq_hands, vq_lower,
                         mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                        joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True)
+                        joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+                        vqvae_latent_scale=vqvae_latent_scale, train_body_part=None
+                    )
+                    
+                    speaker_latents_seed = pose_to_latent(
+                        speaker_pose, speaker_trans_v, vq_upper, vq_hands, vq_lower,
+                        mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
+                        joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+                        vqvae_latent_scale=vqvae_latent_scale, train_body_part=train_body_part
                     )
                     
                     listener_latents = pose_to_latent(
                         listener_pose, listener_trans_v, vq_upper, vq_hands, vq_lower,
                         mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                        joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True)
+                        joint_mask_upper, joint_mask_lower, use_trans=cfg.get('use_trans', True),
+                        vqvae_latent_scale=vqvae_latent_scale, train_body_part=None
                     )
                     
                     condition_dict = {
@@ -578,7 +633,7 @@ def main():
                             "audio_onset": batch_data['speaker']['audio'].cuda(),
                             "word": batch_data['speaker']['word'].cuda(),
                             "id": batch_data['speaker']['id'].cuda() if isinstance(batch_data['speaker']['id'], torch.Tensor) else torch.tensor([batch_data['speaker']['id']]).cuda(),
-                            "seed": speaker_latents[:, :cfg.get('pre_frames', 4)],
+                            "seed": speaker_latents_seed[:, :cfg.get('pre_frames', 4)],
                         }
                     }
                     
@@ -607,12 +662,15 @@ def main():
                     rec_pose = latent_to_pose(
                         generated_latents, vq_upper, vq_hands, vq_lower,
                         mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                        joint_mask_upper, joint_mask_lower, joint_mask_hands
+                        joint_mask_upper, joint_mask_lower, joint_mask_hands,
+                        vqvae_latent_scale=vqvae_latent_scale,
+                        gt_latents=speaker_latents_full, train_body_part=train_body_part
                     )
                     tar_pose = latent_to_pose(
-                        speaker_latents, vq_upper, vq_hands, vq_lower,
+                        speaker_latents_full, vq_upper, vq_hands, vq_lower,
                         mean_upper, std_upper, mean_hands, std_hands, mean_lower, std_lower,
-                        joint_mask_upper, joint_mask_lower, joint_mask_hands
+                        joint_mask_upper, joint_mask_lower, joint_mask_hands,
+                        vqvae_latent_scale=vqvae_latent_scale
                     )
                     
                     remain = n % vae_test_len

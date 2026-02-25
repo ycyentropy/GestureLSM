@@ -176,25 +176,19 @@ class InteractiveGestureDenoiser(nn.Module):
         pos_emb = self.rel_pos(xseq)
         xseq, _ = apply_rotary_pos_emb(xseq, xseq, pos_emb)
         xseq = xseq.reshape(bs_curr, self.joint_num, nframes, -1)
+
+        for block in self.temporal_blocks:
+            xseq = block(xseq)
+
         xseq = xseq.permute(0, 2, 1, 3).reshape(bs_curr, nframes, self.joint_num * self.latent_dim)
 
         for block in self.cross_attn_blocks:
             xseq = block(xseq, at_feat)
 
         if listener_latent is not None:
-            listener_seq_len = listener_latent.shape[1]
-            xseq_len = xseq.shape[1]
-            # 使用全连接注意力（允许每个位置关注 Listener 的全部历史）
-            # 在交互场景下这是合理的，因为 Listener 历史都是已知的过去信息
-            listener_attention_mask = torch.ones(xseq_len, listener_seq_len, device=listener_latent.device).bool()
-            
             for block in self.feedback_cross_attn_blocks:
-                xseq = block(xseq, listener_latent, causal_mask=listener_attention_mask)
+                xseq = block(xseq, listener_latent)
         
-        xseq = xseq.reshape(bs_curr, nframes, self.joint_num, self.latent_dim).permute(0, 2, 1, 3)
-        for block in self.temporal_blocks:
-            xseq = block(xseq)
-        
-        output = self.output_process(xseq)
+        output = self.output_process(xseq.reshape(bs_curr, nframes, self.joint_num, self.latent_dim).permute(0, 2, 1, 3))
         
         return output

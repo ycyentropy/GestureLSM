@@ -379,11 +379,12 @@ class CrossAttentionBlock(nn.Module):
 
 
 class JointAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, dropout=0.0, spatial_first=False):
+    def __init__(self, dim, num_heads=8, dropout=0.0, spatial_first=False, use_causal=True):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.use_causal = use_causal
         
         self.temporal_attention = nn.MultiheadAttention(dim, num_heads, batch_first=True, dropout=dropout)
         self.spatial_attention = nn.MultiheadAttention(dim, num_heads, batch_first=True, dropout=dropout)
@@ -414,11 +415,16 @@ class JointAttention(nn.Module):
         b, n, seq_len, dim = x.shape
         temp_x = x.reshape(b * n, seq_len, dim)
         
-        # Apply RoPE
         temp_x = self._apply_rope(temp_x, self.temporal_pos)
         
-        # Apply attention
-        temporal_out, _ = self.temporal_attention(temp_x, temp_x, temp_x)
+        if self.use_causal:
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
+            temporal_out, _ = self.temporal_attention(
+                temp_x, temp_x, temp_x,
+                attn_mask=causal_mask
+            )
+        else:
+            temporal_out, _ = self.temporal_attention(temp_x, temp_x, temp_x)
         temporal_out = temporal_out + temp_x
         return temporal_out.reshape(b, n, seq_len, dim)
     

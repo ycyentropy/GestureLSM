@@ -1,5 +1,5 @@
 wandb_project: 'GestureLSM'
-exp_name: 'interactive_gesture_lsm'
+exp_name: 'interactive_gesture_lsm_new'
 
 wandb_entity: 'xxxx'
 wandb_key: "xxxxxxx"
@@ -12,8 +12,8 @@ max_val_samples: 100
 # ============================================
 # 单卡训练配置（默认）
 # ============================================
-gpus: [0,1,2,3,4,5,6,7]
-ddp: true
+gpus: [0]
+ddp: false
 
 # ============================================
 # 多卡分布式训练配置示例
@@ -21,6 +21,8 @@ ddp: true
 # ============================================
 # gpus: [0, 1, 2, 3]  # 使用的 GPU 列表
 # ddp: true           # 启用分布式数据并行
+# gpus: [0,1,2,3,4,5,6,7]
+# ddp: true
 # 注意：多卡训练时，总 batch size = train_bs * len(gpus)
 # 例如：train_bs=64, gpus=[0,1,2,3] -> 总 batch size = 256
 
@@ -40,7 +42,7 @@ use_trans: False
 
 pre_frames: 4
 vqvae_squeeze_scale: 4
-vqvae_latent_scale: 5
+vqvae_latent_scale: 1 #5
 vae_length: 240
 vae_test_len: 32
 mean_pose_path: "./mean_std_seamless/mean_pose.npy"
@@ -51,7 +53,7 @@ std_trans_path: "./mean_std_seamless/std_trans.npy"
 data:
   name_pyfile: "dataloaders.dyadic_feedback_dataset"
   class_name: "DyadicFeedbackDataset"
-  train_bs: 64 #128
+  train_bs: 256 #128
   multi_length_training: [1.0]
   root_path: ./
   beat_align: True
@@ -61,9 +63,9 @@ data:
   pose_fps: 30
   rot6d: True
   pose_dims: 825
-  pose_length: 256 #128
-  stride: 60
-  test_length: 256 #128
+  pose_length: 64
+  stride: 20
+  test_length: 256
   audio_sr: 48000
   audio_fps: 100
   audio_norm: False
@@ -94,7 +96,7 @@ model:
   g_name: InteractiveGestureLSM
   do_classifier_free_guidance: True
   guidance_scale: 2.0
-  n_steps: 6
+  n_steps: 20
   use_exp: False
   use_id: False
   max_id: 5000
@@ -111,7 +113,7 @@ model:
       dropout: 0.1
       activation: "gelu"
       n_seed: 4 #8 #只有 pre_frames 和 n_seed 必须一致
-      seq_len: 16 # context_size + window_size = 8 + 24
+      seq_len: 12 # window_size
       flip_sin_to_cos: True
       freq_shift: 0.0
       cond_proj_dim: 256 #512
@@ -130,13 +132,14 @@ model:
       raw_audio: False
       latent_dim: 256
       audio_fps: 100
-      target_length: 256 #256?
+      target_length: 64
+      val_target_length: 256
       spatial_temporal: True
       use_exp: ${model.use_exp}
 
   window_size: 12 #24
-  context_size: 4 #8
-  ladder_step: 4
+  context_size: 4 #4 #8
+  ladder_step: 1 #4
   # noise_range: [0, 1]
   
   # 实时模式：Listener 使用历史动作而非未来动作
@@ -145,11 +148,11 @@ model:
   
   # 是否使用 Listener 反馈（消融实验用）
   # 设为 false 可禁用 Listener 视觉反馈，仅使用音频生成动作
-  use_listener_feedback: true
+  use_listener_feedback: true #true
   
   inertia_weight: 0
-  ofs_threshold: 0.5 #0.8
-  consistency_ratio: 0.25
+  ofs_threshold: 1 #0.8
+  consistency_ratio: 0.25 #0.25
   
   # 损失函数类型: "mse" 或 "huber"
   # mse: 标准均方误差，对所有误差一视同仁
@@ -158,26 +161,29 @@ model:
   huber_delta: 1.0  # Huber损失的阈值参数，仅在loss_type="huber"时生效
   
   cond_drop_prob: 0.1
-  context_noise_prob: 0 #0.3
-  max_context_noise: 0.001
+  context_noise_prob: 0.2 #0.3
+  max_context_noise: 0.2
   listener_drop_prob: 0.1
   
   # Scheduled Sampling: 训练时以一定概率使用预测值替代真值作为 context
   # 0.0: 禁用（始终使用真值）
   # 1.0: 始终使用预测值
   # 推荐值: 0.1-0.3，逐步增加
-  scheduled_sampling_prob: 0.2 #0.3
+  scheduled_sampling_prob: 0 #0.3
 
   use_dual_phase: true      # 启用双阶段调度（训练时）
   pre_roll_prob: 0.2        # 预滚动阶段采样概率
+  pre_roll_steps: 20        # 预滚动阶段去噪步数（独立于 window_size）
   inference_mode: "rflav"   # 推理模式: "rflav" 或 "rdla"
   
   # 时间步加权模式（消融实验用）
   # "none": 无加权（默认）
   # "logit_normal": Logit-Normal 加权，中间时间步权重高
   # "window_aware": 窗口感知加权，首帧权重高（输出帧更重要）
-  timestep_weighting: "logit_normal"
+  timestep_weighting: "none"
   timestep_weight_scale: 1.0  # 加权缩放因子
+
+  train_body_part: null #"upper"
 
 # validation:
 #   val_loss_steps: 200
@@ -202,7 +208,7 @@ solver:
   warmup_epochs: 100
   warmup_lr: 1e-6
   lr_min: 1e-7
-  weight_decay: 1e-2
+  weight_decay: 1e-4
   opt_betas: [0.5, 0.999]
   
   early_stopping:

@@ -108,8 +108,9 @@ class InteractiveGestureLSM(GestureLSM):
         
         self.use_dual_phase = cfg.model.get("use_dual_phase", True)
         self.pre_roll_prob = cfg.model.get("pre_roll_prob", 0.2)
+        self.pre_roll_steps = cfg.model.get("pre_roll_steps", self.window_size)
         if self.use_dual_phase:
-            logger.info(f"Dual-phase timestep scheduling enabled: pre_roll_prob={self.pre_roll_prob}")
+            logger.info(f"Dual-phase timestep scheduling enabled: pre_roll_prob={self.pre_roll_prob}, pre_roll_steps={self.pre_roll_steps}")
         
         self.timestep_weighting = cfg.model.get("timestep_weighting", "none")
         self.timestep_weight_scale = cfg.model.get("timestep_weight_scale", 1.0)
@@ -157,7 +158,7 @@ class InteractiveGestureLSM(GestureLSM):
         
         t_values = []
         for n in range(self.window_size):
-            t_n = t_0 + n * (1.0 - t_0) / (self.window_size - 1)
+            t_n = 1.0 - t_0 - n * (1.0 - t_0) / (self.window_size - 1)
             t_values.append(t_n)
         t_values = torch.stack(t_values, dim=1).to(device)
         
@@ -248,14 +249,6 @@ class InteractiveGestureLSM(GestureLSM):
         return x_t, t_values, noise, phase_mask
     
     def _apply_ladder_noise(self, x0, batch_size, device):
-        """
-        RDLA阶梯噪声调度 (与推理一致)
-        
-        训练时随机采样噪声水平 t_0_l ~ Uniform(1, num_ladders)
-        推理时从 num_ladders 逐步递减到 1
-        
-        阶梯噪声公式: t_n = t_0_l + k (k为阶梯索引)
-        """
         l = self.ladder_step
         N = self.window_size
         num_ladders = N // l
@@ -265,7 +258,7 @@ class InteractiveGestureLSM(GestureLSM):
         t_values = []
         for n in range(N):
             k = n // l
-            t_n = t_0_l + k
+            t_n = num_ladders + (N // l) - 1 - (t_0_l + k)
             t_values.append(t_n)
         t_values = torch.stack(t_values, dim=1).to(device)
         
@@ -296,7 +289,7 @@ class InteractiveGestureLSM(GestureLSM):
     
     def apply_context_noise(self, context_latents, phase_mask=None):
         """
-        对 context 添加噪声
+        对 context 添加高斯噪声
         
         Args:
             context_latents: context 数据
@@ -316,9 +309,7 @@ class InteractiveGestureLSM(GestureLSM):
             noise_mask = noise_mask & (~phase_mask)
         
         if noise_mask.any():
-            noise_scale = torch.rand(batch_size, device=context_latents.device) * self.max_context_noise
-            noise_scale = noise_scale.unsqueeze(1).unsqueeze(2)
-            noise = torch.randn_like(context_latents) * noise_scale
+            noise = torch.randn_like(context_latents) * self.max_context_noise
             context_latents = context_latents + noise * noise_mask.unsqueeze(1).unsqueeze(2).float()
         
         return context_latents
@@ -477,9 +468,9 @@ class InteractiveGestureLSM(GestureLSM):
             abs_error = torch.abs(error)
             quadratic = torch.min(abs_error, torch.tensor(self.huber_delta, device=error.device))
             linear = abs_error - quadratic
-            frame_loss = (0.5 * quadratic ** 2 + self.huber_delta * linear).sum(dim=-1)
+            frame_loss = (0.5 * quadratic ** 2 + self.huber_delta * linear).mean(dim=-1)
         else:
-            frame_loss = (error ** 2).sum(dim=-1)
+            frame_loss = (error ** 2).mean(dim=-1)
         
         timestep_weights = self._compute_timestep_weights(t_values) if t_values is not None else None
         
@@ -493,7 +484,7 @@ class InteractiveGestureLSM(GestureLSM):
             error_n = error[:, :-1, :]
             error_n_plus_1 = error[:, 1:, :]
             
-            inner_product = (error_n * error_n_plus_1).sum(dim=-1)
+            inner_product = (error_n * error_n_plus_1).mean(dim=-1)
             
             inertia_term = -1.0 * self.inertia_weight * inner_product.mean()
         else:
@@ -504,32 +495,16 @@ class InteractiveGestureLSM(GestureLSM):
         return rdla_loss
     
     def get_audio_window(self, audio_features, frame_idx, batch_size, device):
-        """
-        获取与当前窗口匹配的音频特征窗口
-        
-        Args:
-            audio_features: 完整音频特征 [batch, total_frames, dim]
-            frame_idx: 当前帧索引
-            batch_size: batch 大小
-            device: 设备
-            
-        Returns:
-            audio_window: [batch, context_size + window_size, dim]
-        """
-        audio_start = max(0, frame_idx - self.context_size)
+        audio_start = frame_idx
         audio_end = min(audio_features.shape[1], frame_idx + self.window_size)
         audio_window = audio_features[:, audio_start:audio_end, :]
         
         audio_window_len = audio_end - audio_start
-        target_audio_len = self.context_size + self.window_size
+        target_audio_len = self.window_size
         
         if audio_window_len < target_audio_len:
-            if audio_start == 0:
-                padding = torch.zeros(batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
-                audio_window = torch.cat([padding, audio_window], dim=1)
-            else:
-                padding = torch.zeros(batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
-                audio_window = torch.cat([audio_window, padding], dim=1)
+            padding = torch.zeros(batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
+            audio_window = torch.cat([audio_window, padding], dim=1)
         
         return audio_window
     
@@ -602,107 +577,72 @@ class InteractiveGestureLSM(GestureLSM):
             id_emb_expanded = id_emb.unsqueeze(1).repeat(1, audio_features.shape[1], 1)
             audio_features = torch.cat([audio_features, id_emb_expanded], dim=-1)
         
-        window_starts = list(range(pre_frames, seq_len - self.window_size + 1, self.ladder_step))
-        if len(window_starts) == 0:
-            window_starts = [pre_frames]
+        window_start = pre_frames
+        window_end = window_start + self.window_size
         
-        total_flow_loss = 0.0
-        total_inertia_loss = 0.0
-        total_consistency_loss = 0.0
-        num_windows = len(window_starts)
+        window_latents = latents[:, window_start:window_end, :]
         
-        generated_buffer = None
+        x_t, t_values, noise, phase_mask = self.apply_rolling_noise(
+            window_latents, batch_size, device, use_ladder=True
+        )
         
-        for window_start in window_starts:
-            window_end = window_start + self.window_size
-            
-            if window_end > seq_len:
-                window_end = seq_len
-                window_start = max(pre_frames, window_end - self.window_size)
-            
-            window_latents = latents[:, window_start:window_end, :]
-            
-            x_t, t_values, noise, phase_mask = self.apply_rolling_noise(
-                window_latents, batch_size, device, use_ladder=True
-            )
-            
-            context_latents = latents[:, max(0, window_start - self.context_size):window_start, :]
-            if context_latents.shape[1] < self.context_size:
-                padding = torch.zeros(batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
-                context_latents = torch.cat([padding, context_latents], dim=1)
-            
-            context_latents_flow = context_latents[:flow_batch_size].clone()
-            context_latents_flow = self.apply_scheduled_sampling(
-                context_latents_flow, generated_buffer, window_start, device, phase_mask[:flow_batch_size]
-            )
-            context_latents = torch.cat([context_latents_flow, context_latents[flow_batch_size:]], dim=0)
-            context_latents = self.apply_context_noise(context_latents, phase_mask)
-            
-            audio_start = max(0, window_start - self.context_size)
-            audio_end = min(audio_features.shape[1], window_start + self.window_size)
-            audio_window = audio_features[:, audio_start:audio_end, :]
-            audio_window_len = audio_end - audio_start
-            target_audio_len = self.context_size + self.window_size
-            if audio_window_len < target_audio_len:
-                if audio_start == 0:
-                    padding = torch.zeros(batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
-                    audio_window = torch.cat([padding, audio_window], dim=1)
-                else:
-                    padding = torch.zeros(batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
-                    audio_window = torch.cat([audio_window, padding], dim=1)
-            audio_features_flow = self.apply_conditional_dropout(audio_window[:flow_batch_size])
-            
-            listener_window = None
-            if listener_latents is not None and self.use_listener_feedback:
-                listener_start = max(0, window_start - self.context_size)
-                listener_end = window_start
-                if listener_end - listener_start < self.context_size:
-                    listener_window = torch.zeros(batch_size, self.context_size, listener_latents.shape[-1], device=device)
-                    actual_len = listener_end - listener_start
-                    if actual_len > 0:
-                        listener_window[:, -actual_len:, :] = listener_latents[:, listener_start:listener_end, :]
-                else:
-                    listener_window = listener_latents[:, listener_start:listener_end, :]
-                listener_window = self.apply_listener_dropout(listener_window)
-            
-            full_input = torch.cat([context_latents, x_t], dim=1)
-            
-            full_input_4d = full_input.reshape(batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
-            model_output = self.denoiser(
-                x=full_input_4d[:flow_batch_size],
-                timesteps=t_values[:flow_batch_size, 0],
-                seed=condition_dict['y']['seed'][:flow_batch_size],
-                at_feat=audio_features_flow,
-                listener_latent=listener_window[:flow_batch_size] if listener_window is not None else None
-            )
-            model_output = model_output.permute(0, 3, 1, 2).reshape(flow_batch_size, -1, self.num_joints * self.input_dim)
-            
-            if self.flow_mode == "v":
-                target = window_latents[:flow_batch_size] - noise[:flow_batch_size]
+        context_latents = latents[:, max(0, window_start - self.context_size):window_start, :]
+        if context_latents.shape[1] < self.context_size:
+            padding = torch.zeros(batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
+            context_latents = torch.cat([padding, context_latents], dim=1)
+        
+        context_latents = self.apply_context_noise(context_latents, phase_mask)
+        
+        audio_window = audio_features[:, window_start:window_end, :]
+        audio_window_len = audio_window.shape[1]
+        target_audio_len = self.window_size
+        if audio_window_len < target_audio_len:
+            padding = torch.zeros(batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
+            audio_window = torch.cat([audio_window, padding], dim=1)
+        audio_features_flow = self.apply_conditional_dropout(audio_window[:flow_batch_size])
+        
+        listener_window = None
+        if listener_latents is not None and self.use_listener_feedback:
+            listener_start = max(0, window_start - self.context_size)
+            listener_end = window_start
+            if listener_end - listener_start < self.context_size:
+                listener_window = torch.zeros(batch_size, self.context_size, listener_latents.shape[-1], device=device)
+                actual_len = listener_end - listener_start
+                if actual_len > 0:
+                    listener_window[:, -actual_len:, :] = listener_latents[:, listener_start:listener_end, :]
             else:
-                target = window_latents[:flow_batch_size]
-            
-            window_output = model_output[:, self.context_size:, :]
-            
-            window_t_values = t_values[:flow_batch_size]
-            rdla_loss = self.compute_rdla_loss(window_output, target, window_t_values)
-            
-            total_flow_loss += rdla_loss
-            
-            if generated_buffer is None:
-                generated_buffer = window_output.detach()
-            else:
-                generated_buffer = torch.cat([generated_buffer, window_output.detach()], dim=1)
-            
-            if flow_batch_size < batch_size:
-                consistency_loss = self._compute_consistency_loss(
-                    condition_dict, latents, audio_features, batch_size, flow_batch_size,
-                    device, window_start, window_end, listener_latents
-                )
-                total_consistency_loss += consistency_loss
+                listener_window = listener_latents[:, listener_start:listener_end, :]
+            listener_window = self.apply_listener_dropout(listener_window)
         
-        losses["flow_loss"] = total_flow_loss / num_windows
-        losses["consistency_loss"] = total_consistency_loss / num_windows
+        full_input_4d = x_t.reshape(batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
+        model_output = self.denoiser(
+            x=full_input_4d[:flow_batch_size],
+            timesteps=t_values[:flow_batch_size, 0],
+            seed=condition_dict['y']['seed'][:flow_batch_size],
+            at_feat=audio_features_flow,
+            listener_latent=listener_window[:flow_batch_size] if listener_window is not None else None
+        )
+        model_output = model_output.permute(0, 3, 1, 2).reshape(flow_batch_size, -1, self.num_joints * self.input_dim)
+        
+        window_output = model_output
+        
+        if self.flow_mode == "v":
+            target = window_latents[:flow_batch_size] - noise[:flow_batch_size]
+        else:
+            target = window_latents[:flow_batch_size]
+        
+        window_t_values = t_values[:flow_batch_size]
+        flow_loss = self.compute_rdla_loss(window_output, target, window_t_values)
+        
+        losses["flow_loss"] = flow_loss
+        
+        consistency_loss = torch.tensor(0.0, device=device)
+        if flow_batch_size < batch_size:
+            consistency_loss = self._compute_consistency_loss(
+                condition_dict, latents, audio_features, batch_size, flow_batch_size,
+                device, window_start, window_end, listener_latents
+            )
+        losses["consistency_loss"] = consistency_loss
         
         total_loss = losses["flow_loss"] + losses["consistency_loss"]
         losses["loss"] = total_loss
@@ -741,18 +681,12 @@ class InteractiveGestureLSM(GestureLSM):
         
         force_cfg = np.random.choice([True, False], size=cons_batch_size, p=[0.8, 0.2])
         
-        audio_start = max(0, window_start - self.context_size)
-        audio_end = min(audio_features.shape[1], window_start + self.window_size)
-        audio_window = audio_features[cons_start:, audio_start:audio_end, :]
-        audio_window_len = audio_end - audio_start
-        target_audio_len = self.context_size + self.window_size
+        audio_window = audio_features[cons_start:, window_start:window_end, :]
+        audio_window_len = audio_window.shape[1]
+        target_audio_len = self.window_size
         if audio_window_len < target_audio_len:
-            if audio_start == 0:
-                padding = torch.zeros(cons_batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
-                audio_window = torch.cat([padding, audio_window], dim=1)
-            else:
-                padding = torch.zeros(cons_batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
-                audio_window = torch.cat([audio_window, padding], dim=1)
+            padding = torch.zeros(cons_batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
+            audio_window = torch.cat([audio_window, padding], dim=1)
         audio_features_cons = self._apply_force_cfg(audio_window, force_cfg)
         
         listener_window = None
@@ -767,8 +701,7 @@ class InteractiveGestureLSM(GestureLSM):
             else:
                 listener_window = listener_latents[cons_start:, listener_start:listener_end, :]
         
-        full_input = torch.cat([context_latents, x_t], dim=1)
-        full_input_4d = full_input.reshape(cons_batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
+        full_input_4d = x_t.reshape(cons_batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
         
         with torch.no_grad():
             pred_t = self.denoiser(
@@ -780,7 +713,7 @@ class InteractiveGestureLSM(GestureLSM):
                 listener_latent=listener_window
             )
             pred_t = pred_t.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
-            pred_t_window = pred_t[:, self.context_size:, :]
+            pred_t_window = pred_t
             
             d_coef = reshape_coefs(d)
             if self.flow_mode == "v":
@@ -789,9 +722,7 @@ class InteractiveGestureLSM(GestureLSM):
                 speed_t = pred_t_window - x0_noise
             
             x_td = x_t + d_coef * speed_t
-            
-            full_input_td = torch.cat([context_latents, x_td], dim=1)
-            full_input_td_4d = full_input_td.reshape(cons_batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
+            full_input_td_4d = x_td.reshape(cons_batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
             
             pred_td = self.denoiser(
                 x=full_input_td_4d,
@@ -802,7 +733,7 @@ class InteractiveGestureLSM(GestureLSM):
                 listener_latent=listener_window
             )
             pred_td = pred_td.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
-            pred_td_window = pred_td[:, self.context_size:, :]
+            pred_td_window = pred_td
             
             if self.flow_mode == "v":
                 speed_td = pred_td_window
@@ -811,7 +742,6 @@ class InteractiveGestureLSM(GestureLSM):
             
             speed_target = (speed_t + speed_td) / 2
         
-        full_input_4d = full_input.reshape(cons_batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
         model_pred = self.denoiser(
             x=full_input_4d,
             timesteps=t,
@@ -821,7 +751,7 @@ class InteractiveGestureLSM(GestureLSM):
             listener_latent=listener_window
         )
         model_pred = model_pred.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
-        model_pred_window = model_pred[:, self.context_size:, :]
+        model_pred_window = model_pred
         
         if self.flow_mode == "v":
             speed_pred = model_pred_window
@@ -928,7 +858,7 @@ class InteractiveGestureLSM(GestureLSM):
             
             t_values = self._get_ladder_t_values_v2(batch_size, N, l, num_ladders, t_0_l, device)
             
-            full_input = torch.cat([self.context_buffer, self.window_buffer], dim=1)
+            full_input = self.window_buffer
             
             nframes = full_input.shape[1]
             full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
@@ -1111,29 +1041,17 @@ class InteractiveGestureLSM(GestureLSM):
         
         is_pre_roll_phase = True
         pre_roll_step = 0
-        num_pre_roll_steps = T
+        num_pre_roll_steps = self.pre_roll_steps
         
-        while frame_idx < total_frames:
-            if is_pre_roll_phase:
-                w = 1.0 - pre_roll_step / num_pre_roll_steps
-                k = torch.arange(T, device=device).float()
-                t_values = torch.clamp(1.0 - (k / T + w), min=0.0, max=1.0)
-                t_values = t_values.unsqueeze(0).expand(batch_size, -1)
-                
-                dt = 1.0 / T
-                
-                pre_roll_step += 1
-                if pre_roll_step >= num_pre_roll_steps:
-                    is_pre_roll_phase = False
-            else:
-                w = 0.0
-                k = torch.arange(T, device=device).float()
-                t_values = 1.0 - (k + w) / T
-                t_values = t_values.unsqueeze(0).expand(batch_size, -1)
-                
-                dt = 1.0 / T
+        for _ in range(num_pre_roll_steps):
+            w = 1.0 - pre_roll_step / num_pre_roll_steps
+            k = torch.arange(T, device=device).float()
+            t_values = torch.clamp(1.0 - (k / T + w), min=0.0, max=1.0)
+            t_values = t_values.unsqueeze(0).expand(batch_size, -1)
             
-            full_input = torch.cat([self.context_buffer, self.window_buffer], dim=1)
+            dt = 1.0 / num_pre_roll_steps
+            
+            full_input = self.window_buffer
             
             nframes = full_input.shape[1]
             full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
@@ -1169,23 +1087,103 @@ class InteractiveGestureLSM(GestureLSM):
             v_pred = v_pred.squeeze(2)
             v_pred_3d = v_pred.permute(0, 2, 1)
             
-            window_frames = self.window_buffer.shape[1]
-            self.window_buffer = self.window_buffer + dt * v_pred_3d[:, -window_frames:, :]
+            self.window_buffer = self.window_buffer + dt * v_pred_3d
             
-            output_frame = self.window_buffer[:, 0:1, :]
-            generated_sequence.append(output_frame.squeeze(1))
+            pre_roll_step += 1
+        
+        w_curr = 0.0
+        
+        while frame_idx < total_frames:
+            k = torch.arange(T, device=device).float()
+            t_curr = 1.0 - (k + w_curr) / T
+            t_curr = t_curr.unsqueeze(0).expand(batch_size, -1)
+            
+            full_input = self.window_buffer
+            
+            nframes = full_input.shape[1]
+            full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
+            full_input_4d = full_input_4d.permute(0, 2, 3, 1)
+            
+            listener_window = None
+            if listener_latents is not None and self.use_listener_feedback:
+                listener_start = max(0, frame_idx - self.context_size)
+                listener_end = frame_idx
+                if listener_end - listener_start < self.context_size:
+                    listener_window = torch.zeros(batch_size, self.context_size, listener_latents.shape[-1], device=device)
+                    actual_len = listener_end - listener_start
+                    if actual_len > 0:
+                        listener_window[:, -actual_len:, :] = listener_latents[:, listener_start:listener_end, :]
+                else:
+                    listener_window = listener_latents[:, listener_start:listener_end, :]
+            
+            if guidance_scale > 1.0:
+                v_pred = self._guided_denoise_rflav(
+                    full_input_4d, t_curr, condition_dict, 
+                    audio_features, frame_idx, guidance_scale, listener_window
+                )
+            else:
+                at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
+                v_pred = self.denoiser(
+                    x=full_input_4d,
+                    timesteps=t_curr[:, 0],
+                    seed=condition_dict['y']['seed'],
+                    at_feat=at_feat,
+                    listener_latent=listener_window
+                )
+            
+            v_pred = v_pred.squeeze(2)
+            v_pred_3d = v_pred.permute(0, 2, 1)
+            
+            delta_t_full = (1.0 - t_curr).unsqueeze(-1)
+            
+            window_full = self.window_buffer + delta_t_full * v_pred_3d
+            
+            clean_frame = window_full[:, 0:1, :]
+            generated_sequence.append(clean_frame.squeeze(1))
             
             self.context_buffer = torch.cat([
                 self.context_buffer[:, 1:, :],
-                output_frame
+                clean_frame
             ], dim=1)
             if self.context_buffer.shape[1] > self.context_size:
                 self.context_buffer = self.context_buffer[:, -self.context_size:, :]
             
-            self.window_buffer = torch.cat([
-                self.window_buffer[:, 1:, :],
-                torch.randn(batch_size, 1, self.input_dim * self.num_joints, device=device)
-            ], dim=1)
+            window_remain = window_full[:, 1:, :]
+            
+            new_noise = torch.randn(batch_size, 1, self.input_dim * self.num_joints, device=device)
+            self.window_buffer = torch.cat([window_remain, new_noise], dim=1)
+            
+            dt = 1.0 / T
+            w_curr = (w_curr + dt) % 1.0
+            
+            k = torch.arange(T, device=device).float()
+            t_new = 1.0 - (k + w_curr) / T
+            t_new = t_new.unsqueeze(0).expand(batch_size, -1)
+            
+            full_input = self.window_buffer
+            nframes = full_input.shape[1]
+            full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
+            full_input_4d = full_input_4d.permute(0, 2, 3, 1)
+            
+            if guidance_scale > 1.0:
+                v_pred_incr = self._guided_denoise_rflav(
+                    full_input_4d, t_new, condition_dict, 
+                    audio_features, frame_idx, guidance_scale, listener_window
+                )
+            else:
+                at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
+                v_pred_incr = self.denoiser(
+                    x=full_input_4d,
+                    timesteps=t_new[:, 0],
+                    seed=condition_dict['y']['seed'],
+                    at_feat=at_feat,
+                    listener_latent=listener_window
+                )
+            
+            v_pred_incr = v_pred_incr.squeeze(2)
+            v_pred_incr_3d = v_pred_incr.permute(0, 2, 1)
+            
+            self.window_buffer = self.window_buffer + dt * v_pred_incr_3d
             
             frame_idx += 1
         
@@ -1245,6 +1243,7 @@ class InteractiveGestureLSM(GestureLSM):
         
         seed = condition_dict['y']['seed']
         pre_frames = seed.shape[1]
+        self.pre_frames = pre_frames
         T = self.window_size
         total_frames = audio_features.shape[1]
         
@@ -1261,7 +1260,7 @@ class InteractiveGestureLSM(GestureLSM):
         
         is_pre_roll_phase = True
         pre_roll_step = 0
-        num_pre_roll_steps = T
+        num_pre_roll_steps = self.pre_roll_steps
         
         while frame_idx < total_frames:
             if is_pre_roll_phase:
@@ -1270,7 +1269,7 @@ class InteractiveGestureLSM(GestureLSM):
                 t_values = torch.clamp(1.0 - (k / T + w), min=0.0, max=1.0)
                 t_values = t_values.unsqueeze(0).expand(batch_size, -1)
                 
-                dt = 1.0 / T
+                dt = 1.0 / num_pre_roll_steps
                 
                 pre_roll_step += 1
                 if pre_roll_step >= num_pre_roll_steps:
@@ -1283,7 +1282,7 @@ class InteractiveGestureLSM(GestureLSM):
                 
                 dt = 1.0 / T
             
-            full_input = torch.cat([self.context_buffer, self.window_buffer], dim=1)
+            full_input = self.window_buffer
             
             nframes = full_input.shape[1]
             full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
@@ -1321,8 +1320,8 @@ class InteractiveGestureLSM(GestureLSM):
                 self.context_buffer[:, 1:, :],
                 output_frame
             ], dim=1)
-            if self.context_buffer.shape[1] > self.context_size:
-                self.context_buffer = self.context_buffer[:, -self.context_size:, :]
+            if self.context_buffer.shape[1] > pre_frames:
+                self.context_buffer = self.context_buffer[:, -pre_frames:, :]
             
             self.window_buffer = torch.cat([
                 self.window_buffer[:, 1:, :],
@@ -1371,7 +1370,7 @@ class InteractiveGestureLSM(GestureLSM):
                 t_next = timesteps[step + 1]
                 dt = t_next - t_curr
                 
-                full_input = torch.cat([self.context_buffer, self.window_buffer], dim=1)
+                full_input = self.window_buffer
                 
                 nframes = full_input.shape[1]
                 full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
@@ -1474,7 +1473,7 @@ class InteractiveGestureLSM(GestureLSM):
                 t_next = timesteps[step + 1]
                 dt = t_next - t_curr
                 
-                full_input = torch.cat([self.context_buffer, self.window_buffer], dim=1)
+                full_input = self.window_buffer
                 
                 nframes = full_input.shape[1]
                 full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
@@ -1556,16 +1555,17 @@ class InteractiveGestureLSM(GestureLSM):
         
         l = self.ladder_step
         N = self.window_size
-        num_ladders = N // l  # 阶梯数 = 去噪步数
+        num_ladders = N // l
         
         pre_frames = condition_dict['y']['seed'].shape[1]
+        self.pre_frames = pre_frames
         
         for i in range(pre_frames):
             generated_sequence.append(seed[:, i, :])
         
         frame_idx = pre_frames
         
-        t_0_l = num_ladders  # 初始噪声水平 = 阶梯数
+        t_0_l = num_ladders
         
         while frame_idx < total_frames:
             frames_to_generate = min(l, total_frames - frame_idx)
@@ -1574,7 +1574,7 @@ class InteractiveGestureLSM(GestureLSM):
             
             t_values = self._get_ladder_t_values_v2(batch_size, N, l, num_ladders, t_0_l, device)
             
-            full_input = torch.cat([self.context_buffer, self.window_buffer], dim=1)
+            full_input = self.window_buffer
             
             nframes = full_input.shape[1]
             full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
@@ -1623,8 +1623,8 @@ class InteractiveGestureLSM(GestureLSM):
                 output_frames
             ], dim=1)
             
-            if self.context_buffer.shape[1] > self.context_size:
-                self.context_buffer = self.context_buffer[:, -self.context_size:, :]
+            if self.context_buffer.shape[1] > pre_frames:
+                self.context_buffer = self.context_buffer[:, -pre_frames:, :]
             
             if t_0_l == 0:
                 self.window_buffer = torch.randn(
