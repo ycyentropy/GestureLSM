@@ -11,33 +11,8 @@ import math
 from models.wavlm.WavLM import WavLM, WavLMConfig
 
 
-class ExactLengthAdjuster(nn.Module):
-    """
-    Layer that ensures the output has exactly the target length along the time dimension.
-    It either adds or removes frames as needed.
-    """
-    def __init__(self, target_length=196):
-        super(ExactLengthAdjuster, self).__init__()
-        self.target_length = target_length
-    
-    def forward(self, x, target_length=None):
-        if target_length is None:
-            target_length = self.target_length
-        current_length = x.shape[2]
-        
-        if current_length == target_length:
-            return x
-        elif current_length < target_length:
-            frames_to_add = target_length - current_length
-            last_frame = x[:, :, -1:]
-            extra_frames = last_frame.repeat(1, 1, frames_to_add)
-            return torch.cat([x, extra_frames], dim=2)
-        else:
-            return x[:, :, :target_length]
-
-
 class WavEncoder(nn.Module):
-    def __init__(self, out_dim, audio_in=2, target_length=256):
+    def __init__(self, out_dim, audio_in=2):
         super().__init__() 
         self.out_dim = out_dim
         self.feat_extractor = nn.Sequential( 
@@ -48,16 +23,12 @@ class WavEncoder(nn.Module):
                 BasicBlock(out_dim//2, out_dim//2, 15, 1, first_dilation=7),
                 BasicBlock(out_dim//2, out_dim, 15, 3,  first_dilation=0,downsample=True),     
             )
-        self.length_adjuster = ExactLengthAdjuster(target_length=target_length)
-    
-    def forward(self, wav_data, target_length=None):
+    def forward(self, wav_data):
         if wav_data.dim() == 2:
             wav_data = wav_data.unsqueeze(1) 
         else:
             wav_data = wav_data.transpose(1, 2)
         out = self.feat_extractor(wav_data)
-        out = self.length_adjuster(out, target_length)
-        
         return out.transpose(1, 2)
 
 
@@ -71,7 +42,7 @@ class ModalityEncoder(nn.Module):
                  latent_dim=256,
                  audio_fps=30,
                  use_exp=False,
-                 target_length=256,
+                 target_length=None,
                  val_target_length=None,
                  spatial_temporal=False,
                  vocab_path=None
@@ -81,10 +52,9 @@ class ModalityEncoder(nn.Module):
         self.raw_audio = raw_audio
         self.latent_dim = latent_dim
         self.audio_fps = audio_fps
-        self.val_target_length = val_target_length if val_target_length is not None else target_length
         
 
-        self.WavEncoder = WavEncoder(audio_dim, audio_in=audio_in, target_length=target_length)
+        self.WavEncoder = WavEncoder(audio_dim, audio_in=audio_in)
         self.text_encoder_body = nn.Linear(300, audio_dim) 
 
         if vocab_path is None:
@@ -111,8 +81,8 @@ class ModalityEncoder(nn.Module):
             else:
                 self.mix_audio_text = nn.Linear(audio_dim*2, self.latent_dim * (3 if spatial_temporal else 1))
     
-    def forward(self, audio, word, raw_audio=None, squeeze_scale=4, target_length=None):
-        audio_feat = self.WavEncoder(audio, target_length)
+    def forward(self, audio, word, raw_audio=None, squeeze_scale=4):
+        audio_feat = self.WavEncoder(audio)
         word_clamped = torch.clamp(word, 0, self.text_pre_encoder_body.num_embeddings - 1)
         text_feat = self.text_encoder_body(self.text_pre_encoder_body(word_clamped))
         if raw_audio is not None and self.raw_audio:
@@ -123,10 +93,20 @@ class ModalityEncoder(nn.Module):
             audio_len = audio_feat.shape[1]
             text_len = text_feat.shape[1]
             
-            if text_len != audio_len:
+            target_len = text_len * squeeze_scale
+            
+            if audio_len != target_len:
+                audio_feat = F.interpolate(
+                    audio_feat.transpose(1, 2),
+                    size=target_len,
+                    mode='linear',
+                    align_corners=True
+                ).transpose(1, 2)
+            
+            if text_len != target_len:
                 text_feat_aligned = F.interpolate(
                     text_feat.transpose(1, 2),
-                    size=audio_len,
+                    size=target_len,
                     mode='linear',
                     align_corners=True
                 ).transpose(1, 2)

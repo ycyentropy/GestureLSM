@@ -297,13 +297,28 @@ class InteractiveGestureTrainer:
             ckpt_state_dict = torch.load(checkpoint_path, weights_only=False)[
                 "model_state"
             ]
+        
+        # 移除 module. 前缀（DDP 训练时保存的格式）
+        new_state_dict = {}
+        for k, v in ckpt_state_dict.items():
+            if k.startswith('module.'):
+                new_state_dict[k[7:]] = v  # 移除 'module.' 前缀
+            else:
+                new_state_dict[k] = v
+        ckpt_state_dict = new_state_dict
+        
+        # 过滤不需要的参数
         ckpt_state_dict = {
             k: v
             for k, v in ckpt_state_dict.items()
             if "modality_encoder.audio_encoder." not in k
             and "modality_encoder.text_pre_encoder_body." not in k
         }
-        self.model.load_state_dict(ckpt_state_dict, strict=False)
+        missing_keys, unexpected_keys = self.model.load_state_dict(ckpt_state_dict, strict=False)
+        if missing_keys:
+            logger.warning(f"Missing keys in checkpoint: {missing_keys[:10]}...")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys[:10]}...")
         logger.info(f"Loaded checkpoint from {checkpoint_path}")
 
     def _load_data(self, dict_data):
@@ -703,56 +718,56 @@ class InteractiveGestureTrainer:
                 }
 
                 if self.cfg.ddp:
-                    val_target_length = getattr(self.cfg.model.modality_encoder.params, 'val_target_length', 
-                                                self.cfg.model.modality_encoder.params.get('val_target_length', None))
                     audio_features = self.model.module.modality_encoder(
                         loaded_data["audio_onset"],
-                        loaded_data["word"],
-                        target_length=val_target_length
+                        loaded_data["word"]
                     )
                     listener_loader = OnlineListenerLoader(
                         loaded_data["listener_latents"],
                         context_size=self.model.module.context_size
                     )
+                    total_frames = loaded_data["speaker_latents"].shape[1]
                     if self.inference_mode == "rflav":
                         generated_latents = self.model.module.generate_online_rflav(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
-                            guidance_scale=self.cfg.model.guidance_scale
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
                         )
                     else:
                         generated_latents = self.model.module.generate_online_rdla(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
-                            guidance_scale=self.cfg.model.guidance_scale
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
                         )
                 else:
-                    val_target_length = getattr(self.cfg.model.modality_encoder.params, 'val_target_length',
-                                                self.cfg.model.modality_encoder.params.get('val_target_length', None))
                     audio_features = self.model.modality_encoder(
                         loaded_data["audio_onset"],
-                        loaded_data["word"],
-                        target_length=val_target_length
+                        loaded_data["word"]
                     )
                     listener_loader = OnlineListenerLoader(
                         loaded_data["listener_latents"],
                         context_size=self.model.context_size
                     )
+                    total_frames = loaded_data["speaker_latents"].shape[1]
                     if self.inference_mode == "rflav":
                         generated_latents = self.model.generate_online_rflav(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
-                            guidance_scale=self.cfg.model.guidance_scale
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
                         )
                     else:
                         generated_latents = self.model.generate_online_rdla(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
-                            guidance_scale=self.cfg.model.guidance_scale
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
                         )
 
                 bs, n_latent = loaded_data["speaker_latents"].shape[0], loaded_data["speaker_latents"].shape[1]
@@ -853,56 +868,56 @@ class InteractiveGestureTrainer:
                 }
 
                 if self.cfg.ddp:
-                    val_target_length = getattr(self.cfg.model.modality_encoder.params, 'val_target_length', 
-                                                self.cfg.model.modality_encoder.params.get('val_target_length', None))
                     audio_features = self.model.module.modality_encoder(
                         loaded_data["audio_onset"],
-                        loaded_data["word"],
-                        target_length=val_target_length
+                        loaded_data["word"]
                     )
                     listener_loader = OnlineListenerLoader(
                         loaded_data["listener_latents"],
                         context_size=self.model.module.context_size
                     )
+                    total_frames = loaded_data["speaker_latents"].shape[1]
                     if self.inference_mode == "rflav":
                         generated_latents = self.model.module.generate_online_rflav(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
-                            guidance_scale=self.cfg.model.guidance_scale
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
                         )
                     else:
                         generated_latents = self.model.module.generate_online_rdla(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
-                            guidance_scale=self.cfg.model.guidance_scale
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
                         )
                 else:
-                    val_target_length = getattr(self.cfg.model.modality_encoder.params, 'val_target_length',
-                                                self.cfg.model.modality_encoder.params.get('val_target_length', None))
                     audio_features = self.model.modality_encoder(
                         loaded_data["audio_onset"],
-                        loaded_data["word"],
-                        target_length=val_target_length
+                        loaded_data["word"]
                     )
                     listener_loader = OnlineListenerLoader(
                         loaded_data["listener_latents"],
                         context_size=self.model.context_size
                     )
+                    total_frames = loaded_data["speaker_latents"].shape[1]
                     if self.inference_mode == "rflav":
                         generated_latents = self.model.generate_online_rflav(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
-                            guidance_scale=self.cfg.model.guidance_scale
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
                         )
                     else:
                         generated_latents = self.model.generate_online_rdla(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
-                            guidance_scale=self.cfg.model.guidance_scale
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
                         )
 
                 bs, n_latent = loaded_data["speaker_latents"].shape[0], loaded_data["speaker_latents"].shape[1]

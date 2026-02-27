@@ -1232,11 +1232,14 @@ class InteractiveGestureLSM(GestureLSM):
     
     @torch.no_grad()
     def generate_online_rflav(self, condition_dict, audio_features, listener_loader,
-                              guidance_scale=2.0):
+                              guidance_scale=2.0, total_frames=None):
         """
         RFLAV 风格在线推理流程：使用双阶段时间步调度
         
         适用于在线交互场景，Listener 数据通过 listener_loader 逐步获取
+        
+        Args:
+            total_frames: 生成总帧数（latent长度）。如果为None，则使用audio_features.shape[1]
         """
         batch_size = audio_features.shape[0]
         device = audio_features.device
@@ -1245,7 +1248,8 @@ class InteractiveGestureLSM(GestureLSM):
         pre_frames = seed.shape[1]
         self.pre_frames = pre_frames
         T = self.window_size
-        total_frames = audio_features.shape[1]
+        if total_frames is None:
+            total_frames = audio_features.shape[1]
         
         self.window_buffer = torch.randn(
             batch_size, T, self.input_dim * self.num_joints, device=device
@@ -1533,7 +1537,7 @@ class InteractiveGestureLSM(GestureLSM):
     
     @torch.no_grad()
     def generate_online_rdla(self, condition_dict, audio_features, listener_loader,
-                             guidance_scale=2.0):
+                             guidance_scale=2.0, total_frames=None):
         """
         RDLA在线推理流程：每次迭代只进行1步去噪，然后平移l帧
         
@@ -1543,6 +1547,9 @@ class InteractiveGestureLSM(GestureLSM):
         3. 经过(阶梯数)次迭代后，完整窗口处理完毕
         
         去噪步数 = 阶梯数 = window_size / ladder_step
+        
+        Args:
+            total_frames: 生成总帧数（latent长度）。如果为None，则使用audio_features.shape[1]
         """
         batch_size = audio_features.shape[0]
         device = audio_features.device
@@ -1551,7 +1558,8 @@ class InteractiveGestureLSM(GestureLSM):
         self.init_rolling_window(batch_size, device, idle_pose=seed)
         
         generated_sequence = []
-        total_frames = audio_features.shape[1]
+        if total_frames is None:
+            total_frames = audio_features.shape[1]
         
         l = self.ladder_step
         N = self.window_size
