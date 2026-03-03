@@ -1,5 +1,5 @@
 wandb_project: 'GestureLSM'
-exp_name: 'interactive_gesture_lsm_new'
+exp_name: 'interactive_gesture_lsm_3_2'
 
 wandb_entity: 'xxxx'
 wandb_key: "xxxxxxx"
@@ -7,20 +7,20 @@ wandb_log_dir: './outputs/wandb'
 output_dir: ./outputs/interactive_gesture_lsm
 log_period: 50
 val_period: 10
-max_val_samples: 100
+max_val_samples: 10
 
 # ============================================
 # 单卡训练配置（默认）
 # ============================================
-gpus: [0]
-ddp: false
+# gpus: [0]
+# ddp: false
 
 # ============================================
 # 多卡分布式训练配置示例
 # 取消注释以下配置并注释上面的单卡配置即可启用
 # ============================================
-# gpus: [0, 1, 2, 3]  # 使用的 GPU 列表
-# ddp: true           # 启用分布式数据并行
+gpus: [0, 1, 2, 3]  # 使用的 GPU 列表
+ddp: true           # 启用分布式数据并行
 # gpus: [0,1,2,3,4,5,6,7]
 # ddp: true
 # 注意：多卡训练时，总 batch size = train_bs * len(gpus)
@@ -96,7 +96,7 @@ model:
   g_name: InteractiveGestureLSM
   do_classifier_free_guidance: True
   guidance_scale: 2.0
-  n_steps: 20
+  n_steps: 12
   use_exp: False
   use_id: False
   max_id: 5000
@@ -110,10 +110,10 @@ model:
       ff_size: 1024
       num_layers: 8
       num_heads: 4
-      dropout: 0.1
+      dropout: 0.2 #0.1
       activation: "gelu"
       n_seed: 4 #8 #只有 pre_frames 和 n_seed 必须一致
-      seq_len: 12 # window_size
+      seq_len: 10 # window_size
       flip_sin_to_cos: True
       freq_shift: 0.0
       cond_proj_dim: 256 #512
@@ -132,8 +132,8 @@ model:
       raw_audio: False
       latent_dim: 256
       audio_fps: 100
-      target_length: 64
-      val_target_length: 256
+      # target_length: 64
+      # val_target_length: 256
       spatial_temporal: True
       use_exp: ${model.use_exp}
 
@@ -160,10 +160,11 @@ model:
   loss_type: huber
   huber_delta: 1.0  # Huber损失的阈值参数，仅在loss_type="huber"时生效
   
-  cond_drop_prob: 0.1
-  context_noise_prob: 0.2 #0.3
-  max_context_noise: 0.2
-  listener_drop_prob: 0.1
+  cond_drop_prob: 0.2
+  force_cfg_prob: 0.8  # 一致性损失中强制使用 null embedding 的概率
+  # context_noise_prob: 0.2 #0.3
+  # max_context_noise: 0.2
+  # listener_drop_prob: 0.1
   
   # Scheduled Sampling: 训练时以一定概率使用预测值替代真值作为 context
   # 0.0: 禁用（始终使用真值）
@@ -173,14 +174,14 @@ model:
 
   use_dual_phase: true      # 启用双阶段调度（训练时）
   pre_roll_prob: 0.2        # 预滚动阶段采样概率
-  pre_roll_steps: 20        # 预滚动阶段去噪步数（独立于 window_size）
+  pre_roll_steps: 12        # 预滚动阶段去噪步数（独立于 window_size）
   inference_mode: "rflav"   # 推理模式: "rflav" 或 "rdla"
   
   # 时间步加权模式（消融实验用）
   # "none": 无加权（默认）
   # "logit_normal": Logit-Normal 加权，中间时间步权重高
   # "window_aware": 窗口感知加权，首帧权重高（输出帧更重要）
-  timestep_weighting: "none"
+  timestep_weighting: "logit_normal"
   timestep_weight_scale: 1.0  # 加权缩放因子
 
   train_body_part: null #"upper"
@@ -201,14 +202,16 @@ solver:
   amsgrad: False
   
   lr_base: 1e-5
-  lr_policy: 'step'
+  lr_policy: 'exponential' #cosine #step
+  gamma: 0.99
   decay_rate: 0.1
-  lr_warmup_steps: 50
+  # lr_warmup_steps: 50
   decay_epochs: 500
-  warmup_epochs: 100
+  warmup_epochs: 10
   warmup_lr: 1e-6
   lr_min: 1e-7
-  weight_decay: 1e-4
+  COOLDOWN_EPOCHS: 10  # Cosine scheduler 冷却期 epoch 数
+  weight_decay: 1e-2
   opt_betas: [0.5, 0.999]
   
   early_stopping:

@@ -100,4 +100,44 @@ def create_scheduler(args, optimizer, **kwargs):
             eta_min = 1e-6,
             last_epoch=-1,
         )
+    elif args.lr_policy == "cosineannealing":
+        # T_max: 学习率从 max 到 min 的 epoch 数
+        # 如果未指定，使用总 epoch 减去 warmup 和 cooldown
+        t_max = getattr(args, 't_max', None)
+        if t_max is None:
+            t_max = num_epochs - getattr(args, 'warmup_epochs', 0) - getattr(args, 'COOLDOWN_EPOCHS', 0)
+        
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=t_max,
+            eta_min=args.lr_min,
+        )
+    elif args.lr_policy == "exponential":
+        # ExponentialLR with warmup and min_lr
+        # gamma: 衰减因子，通常 0.9-0.99
+        gamma = getattr(args, 'gamma', 0.99)
+        lr_min = getattr(args, 'lr_min', 1e-7)
+        warmup_epochs = getattr(args, 'warmup_epochs', 0)
+        warmup_lr = getattr(args, 'warmup_lr', None)
+        lr_init = optimizer.param_groups[0]['lr']
+        
+        if warmup_lr is None:
+            warmup_lr = lr_min
+        
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                # Warmup 阶段：线性增加
+                alpha = epoch / warmup_epochs
+                lr = warmup_lr + (lr_init - warmup_lr) * alpha
+            else:
+                # Exponential 衰减阶段
+                t = epoch - warmup_epochs
+                lr = lr_init * (gamma ** t)
+                lr = max(lr, lr_min)
+            return lr / lr_init
+        
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lr_lambda,
+        )
     return lr_scheduler

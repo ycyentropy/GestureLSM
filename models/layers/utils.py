@@ -118,7 +118,8 @@ class OutputProcess(nn.Module):
         output = self.poseFinal(output)
         output = output.permute(0, 1, 3, 2)  # [bs, njoints, nfeats, nframes]
         
-        output = output.reshape(bs, n_joints * 128, 1, nframes)
+        # output = output.reshape(bs, n_joints * 128, 1, nframes)
+        output = output.reshape(bs, n_joints * self.input_feats, 1, nframes)
         return output
 
 class SinusoidalEmbeddings(nn.Module):

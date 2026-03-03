@@ -15,7 +15,7 @@ class InteractiveGestureDenoiser(nn.Module):
         ff_size=1024,
         num_layers=8,
         num_cross_attn_layers=3,
-        num_feedback_attn_layers=1,
+        num_feedback_attn_layers=3,
         num_heads=4,
         dropout=0.1,
         activation="gelu",
@@ -149,7 +149,6 @@ class InteractiveGestureDenoiser(nn.Module):
         
         time_emb = self.time_proj(timesteps)
         time_emb = time_emb.to(dtype=x.dtype)
-
         if cond_time is not None and hasattr(self, 'cond_proj') and self.cond_proj is not None:
             cond_time = cond_time.expand(bs_curr).clone()
             cond_emb = self.cond_proj(cond_time)

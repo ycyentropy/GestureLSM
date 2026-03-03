@@ -152,7 +152,6 @@ model:
       raw_audio: False
       latent_dim: 256
       audio_fps: 100
-      target_length: 128
       spatial_temporal: True
       use_exp: ${model.use_exp}
 

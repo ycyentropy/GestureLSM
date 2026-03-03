@@ -12,24 +12,34 @@ from models.wavlm.WavLM import WavLM, WavLMConfig
 
 
 class WavEncoder(nn.Module):
-    def __init__(self, out_dim, audio_in=2):
+    """
+    音频特征编码器（简化版）
+    
+    输入：[batch, seq_len, audio_dim]
+    输出：[batch, seq_len, out_dim]
+    
+    不再使用过度下采样的卷积网络，而是使用简单的线性投影
+    """
+    def __init__(self, audio_dim, out_dim):
         super().__init__() 
         self.out_dim = out_dim
-        self.feat_extractor = nn.Sequential( 
-                BasicBlock(audio_in, out_dim//4, 15, 5, first_dilation=1700, downsample=True),
-                BasicBlock(out_dim//4, out_dim//4, 15, 6, first_dilation=0, downsample=True),
-                BasicBlock(out_dim//4, out_dim//4, 15, 1, first_dilation=7, ),
-                BasicBlock(out_dim//4, out_dim//2, 15, 6, first_dilation=0, downsample=True),
-                BasicBlock(out_dim//2, out_dim//2, 15, 1, first_dilation=7),
-                BasicBlock(out_dim//2, out_dim, 15, 3,  first_dilation=0,downsample=True),     
-            )
+        self.audio_dim = audio_dim
+        
+        self.projection = nn.Sequential(
+            nn.Linear(audio_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(out_dim, out_dim),
+        )
+    
     def forward(self, wav_data):
-        if wav_data.dim() == 2:
-            wav_data = wav_data.unsqueeze(1) 
-        else:
-            wav_data = wav_data.transpose(1, 2)
-        out = self.feat_extractor(wav_data)
-        return out.transpose(1, 2)
+        """
+        Args:
+            wav_data: [batch, seq_len, audio_dim]
+        Returns:
+            [batch, seq_len, out_dim]
+        """
+        return self.projection(wav_data)
 
 
 class ModalityEncoder(nn.Module):
@@ -37,7 +47,7 @@ class ModalityEncoder(nn.Module):
                  data_path, 
                  t_fix_pre, 
                  audio_dim, 
-                 audio_in=2,
+                 audio_in=128,
                  raw_audio=False,
                  latent_dim=256,
                  audio_fps=30,
@@ -45,29 +55,32 @@ class ModalityEncoder(nn.Module):
                  target_length=None,
                  val_target_length=None,
                  spatial_temporal=False,
-                 vocab_path=None
+                 vocab_path=None,
+                 vqvae_squeeze_scale=4,
                  ):
         super().__init__()
         
         self.raw_audio = raw_audio
         self.latent_dim = latent_dim
         self.audio_fps = audio_fps
+        self.audio_dim = audio_dim
+        self.audio_in = audio_in
+        self.vqvae_squeeze_scale = vqvae_squeeze_scale
         
-
-        self.WavEncoder = WavEncoder(audio_dim, audio_in=audio_in)
-        self.text_encoder_body = nn.Linear(300, audio_dim) 
-
         if vocab_path is None:
             vocab_path = f"{data_path}weights/vocab.pkl"
         with open(vocab_path, 'rb') as f:
             self.lang_model = pickle.load(f)
             pre_trained_embedding = self.lang_model.word_embedding_weights
-        self.text_pre_encoder_body = nn.Embedding.from_pretrained(torch.FloatTensor(pre_trained_embedding),freeze=t_fix_pre)
+        self.text_pre_encoder_body = nn.Embedding.from_pretrained(
+            torch.FloatTensor(pre_trained_embedding), freeze=t_fix_pre
+        )
         word_dim = pre_trained_embedding.shape[1]
+        
+        self.wav_encoder = WavEncoder(audio_in, audio_dim)
+        self.text_encoder_body = nn.Linear(word_dim, audio_dim)
 
         if self.raw_audio:
-            # load the pre-trained wavlm model
-            # self.load_and_freeze_wavlm()
             self.audio_projection = nn.Linear(1024, audio_dim)
 
         if self.raw_audio:
@@ -82,43 +95,61 @@ class ModalityEncoder(nn.Module):
                 self.mix_audio_text = nn.Linear(audio_dim*2, self.latent_dim * (3 if spatial_temporal else 1))
     
     def forward(self, audio, word, raw_audio=None, squeeze_scale=4):
-        audio_feat = self.WavEncoder(audio)
+        """
+        参考 modality_encoder_raw.py 的处理流程：
+        1. 编码音频和文本
+        2. 插值到中间长度（text_len），在更高分辨率上融合
+        3. 拼接
+        4. 投影
+        5. 池化到目标长度
+        
+        Args:
+            audio: [batch, audio_seq_len, audio_in] 音频特征（Mel 频谱）
+            word: [batch, text_seq_len] 文本 token ID（与 pose 对齐）
+            raw_audio: 可选的原始音频特征（WavLM）
+            squeeze_scale: VQ-VAE 下采样倍数（默认 4）
+        
+        Returns:
+            [batch, target_len, latent_dim] 多模态特征
+            输出长度与 VQ-VAE 的 latent 长度对齐
+        """
+        batch_size = audio.shape[0]
+        audio_len = audio.shape[1]
+        
         word_clamped = torch.clamp(word, 0, self.text_pre_encoder_body.num_embeddings - 1)
         text_feat = self.text_encoder_body(self.text_pre_encoder_body(word_clamped))
+        text_len = text_feat.shape[1]
+        
+        audio_feat = self.wav_encoder(audio)
+        
+        if audio_feat.shape[1] != text_len:
+            audio_feat = F.interpolate(
+                audio_feat.transpose(1, 2),
+                size=text_len,
+                mode='linear',
+                align_corners=True
+            ).transpose(1, 2)
+        
         if raw_audio is not None and self.raw_audio:
             raw_feat = self.audio_projection(raw_audio)
             
+            if raw_feat.shape[1] != text_len:
+                raw_feat = F.interpolate(
+                    raw_feat.transpose(1, 2),
+                    size=text_len,
+                    mode='linear',
+                    align_corners=True
+                ).transpose(1, 2)
+            
             at_feat = torch.cat([audio_feat, raw_feat, text_feat], dim=2)
         else:
-            audio_len = audio_feat.shape[1]
-            text_len = text_feat.shape[1]
-            
-            target_len = text_len * squeeze_scale
-            
-            if audio_len != target_len:
-                audio_feat = F.interpolate(
-                    audio_feat.transpose(1, 2),
-                    size=target_len,
-                    mode='linear',
-                    align_corners=True
-                ).transpose(1, 2)
-            
-            if text_len != target_len:
-                text_feat_aligned = F.interpolate(
-                    text_feat.transpose(1, 2),
-                    size=target_len,
-                    mode='linear',
-                    align_corners=True
-                ).transpose(1, 2)
-            else:
-                text_feat_aligned = text_feat
-            
-            at_feat = torch.cat([audio_feat, text_feat_aligned], dim=2)
+            at_feat = torch.cat([audio_feat, text_feat], dim=2)
         
         at_feat = self.mix_audio_text(at_feat)
         
         at_feat = F.avg_pool1d(at_feat.transpose(1, 2), squeeze_scale)
         at_feat = at_feat.transpose(1, 2)
+        
         return at_feat
 
     @torch.no_grad()
@@ -134,7 +165,6 @@ class ModalityEncoder(nn.Module):
 
     def extract_wavlm_feats(self, wav_input_16khz):
         assert self.audio_encoder is not None, "Please load the wavlm model first"
-        # check the input type
         if isinstance(wav_input_16khz, np.ndarray):
             wav_input_16khz = torch.from_numpy(wav_input_16khz)
         if wav_input_16khz.dim() == 1:
@@ -145,7 +175,7 @@ class ModalityEncoder(nn.Module):
             wav_input_16khz = F.layer_norm(wav_input_16khz, wav_input_16khz.shape)
         
         wavlm_feats = self.audio_encoder.extract_features(wav_input_16khz)[0]
-        wavlm_feats = wavlm_feats.detach() # (bs, seq_len, dim)
+        wavlm_feats = wavlm_feats.detach()
         
         target_size = math.ceil(wavlm_feats.shape[1] / 50 * self.audio_fps)
         wavlm_feats = F.interpolate(
@@ -155,4 +185,3 @@ class ModalityEncoder(nn.Module):
             mode='linear'
         ).transpose(1, 2)
         return wavlm_feats
-        

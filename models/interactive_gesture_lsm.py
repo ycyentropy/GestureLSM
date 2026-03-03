@@ -82,6 +82,7 @@ class InteractiveGestureLSM(GestureLSM):
         self.max_context_noise = cfg.model.get("max_context_noise", 0.1)
         
         self.listener_drop_prob = cfg.model.get("listener_drop_prob", 0.1)
+        self.force_cfg_prob = cfg.model.get("force_cfg_prob", 0.8)
         
         self.scheduled_sampling_prob = cfg.model.get("scheduled_sampling_prob", 0.0)
         if self.scheduled_sampling_prob > 0:
@@ -101,7 +102,7 @@ class InteractiveGestureLSM(GestureLSM):
         )
         
         self.window_buffer = None
-        self.context_buffer = None
+        # self.context_buffer = None
         
         if self.window_size % self.ladder_step != 0:
             logger.warning(f"window_size ({self.window_size}) should be divisible by ladder_step ({self.ladder_step})")
@@ -123,14 +124,15 @@ class InteractiveGestureLSM(GestureLSM):
             device=device
         )
         
-        if idle_pose is not None:
-            # idle_pose 已经是 [batch_size, seq_len, latent_dim] 形状
-            self.context_buffer = idle_pose
-        else:
-            self.context_buffer = torch.randn(
-                batch_size, self.context_size, self.input_dim * self.num_joints,
-                device=device
-            ) * 0.001
+        # 注释掉 context_buffer 初始化：暂时不使用 Speaker 的 context 信息
+        # if idle_pose is not None:
+        #     # idle_pose 已经是 [batch_size, seq_len, latent_dim] 形状
+        #     self.context_buffer = idle_pose
+        # else:
+        #     self.context_buffer = torch.randn(
+        #         batch_size, self.context_size, self.input_dim * self.num_joints,
+        #         device=device
+        #     ) * 0.001
     
     def apply_rolling_noise(self, x0, batch_size, device, use_ladder=True):
         """
@@ -314,21 +316,65 @@ class InteractiveGestureLSM(GestureLSM):
         
         return context_latents
     
-    def apply_listener_dropout(self, listener_latent):
+    def apply_listener_dropout(self, listener_latent, drop_mask=None):
         if not self.training or listener_latent is None:
             return listener_latent
         
         batch_size = listener_latent.shape[0]
-        drop_mask = torch.rand(batch_size, device=listener_latent.device) < self.listener_drop_prob
+        if drop_mask is None:
+            drop_mask = torch.rand(batch_size, device=listener_latent.device) < self.listener_drop_prob
         
         if drop_mask.any():
             listener_latent = listener_latent.clone()
             target_seq_len = listener_latent.shape[1]
-            # 使用专门的 null_listener_embed，并扩展到目标序列长度
             null_embed = self.null_listener_embed.expand(target_seq_len, -1)
             listener_latent[drop_mask] = null_embed.unsqueeze(0).expand(drop_mask.sum(), -1, -1)
         
         return listener_latent
+    
+    def apply_joint_dropout(self, audio_feat, listener_feat, drop_prob=None):
+        """
+        同步丢弃音频和 listener 条件
+        
+        确保训练时音频和 listener 使用同一个 dropout mask，
+        这样训练和推理时的 CFG 行为一致。
+        
+        Args:
+            audio_feat: [batch, seq_len, audio_dim] 音频特征
+            listener_feat: [batch, context_size, listener_dim] listener 特征
+            drop_prob: 丢弃概率，默认使用 self.cond_drop_prob
+        
+        Returns:
+            audio_dropped: 可能被丢弃的音频特征
+            listener_dropped: 可能被丢弃的 listener 特征
+            drop_mask: 使用的 dropout mask（用于调试）
+        """
+        if not self.training:
+            return audio_feat, listener_feat, None
+        
+        if drop_prob is None:
+            drop_prob = self.cond_drop_prob
+        
+        batch_size = audio_feat.shape[0]
+        drop_mask = torch.rand(batch_size, device=audio_feat.device) < drop_prob
+        
+        target_seq_len = audio_feat.shape[1]
+        target_feat_dim = audio_feat.shape[2]
+        null_cond_embed = self.denoiser.get_null_cond_embed(target_seq_len, target_feat_dim, audio_feat.device)
+        
+        audio_dropped = audio_feat.clone()
+        audio_dropped[drop_mask] = null_cond_embed.unsqueeze(0).expand(drop_mask.sum(), -1, -1)
+        
+        if listener_feat is not None:
+            listener_seq_len = listener_feat.shape[1]
+            null_listener = self.null_listener_embed.expand(listener_seq_len, -1)
+            
+            listener_dropped = listener_feat.clone()
+            listener_dropped[drop_mask] = null_listener.unsqueeze(0).expand(drop_mask.sum(), -1, -1)
+        else:
+            listener_dropped = None
+        
+        return audio_dropped, listener_dropped, drop_mask
     
     def apply_scheduled_sampling(self, context_latents, generated_buffer, window_start, device, phase_mask=None):
         """
@@ -526,13 +572,14 @@ class InteractiveGestureLSM(GestureLSM):
             new_frame
         ], dim=1)
         
-        self.context_buffer = torch.cat([
-            self.context_buffer[:, step:, :],
-            self.window_buffer[:, :step, :]
-        ], dim=1)
-        
-        if self.context_buffer.shape[1] > self.context_size:
-            self.context_buffer = self.context_buffer[:, -self.context_size:, :]
+        # 注释掉 context_buffer 滚动：暂时不使用 Speaker 的 context 信息
+        # self.context_buffer = torch.cat([
+        #     self.context_buffer[:, step:, :],
+        #     self.window_buffer[:, :step, :]
+        # ], dim=1)
+        # 
+        # if self.context_buffer.shape[1] > self.context_size:
+        #     self.context_buffer = self.context_buffer[:, -self.context_size:, :]
     
     def apply_ofs_smoothing(self, frames, threshold=None):
         if threshold is None:
@@ -586,12 +633,12 @@ class InteractiveGestureLSM(GestureLSM):
             window_latents, batch_size, device, use_ladder=True
         )
         
-        context_latents = latents[:, max(0, window_start - self.context_size):window_start, :]
-        if context_latents.shape[1] < self.context_size:
-            padding = torch.zeros(batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
-            context_latents = torch.cat([padding, context_latents], dim=1)
-        
-        context_latents = self.apply_context_noise(context_latents, phase_mask)
+        # 注释掉 context 处理：暂时不使用 Speaker 的 context 信息
+        # context_latents = latents[:, max(0, window_start - self.context_size):window_start, :]
+        # if context_latents.shape[1] < self.context_size:
+        #     padding = torch.zeros(batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
+        #     context_latents = torch.cat([padding, context_latents], dim=1)
+        # context_latents = self.apply_context_noise(context_latents, phase_mask)
         
         audio_window = audio_features[:, window_start:window_end, :]
         audio_window_len = audio_window.shape[1]
@@ -599,7 +646,6 @@ class InteractiveGestureLSM(GestureLSM):
         if audio_window_len < target_audio_len:
             padding = torch.zeros(batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
             audio_window = torch.cat([audio_window, padding], dim=1)
-        audio_features_flow = self.apply_conditional_dropout(audio_window[:flow_batch_size])
         
         listener_window = None
         if listener_latents is not None and self.use_listener_feedback:
@@ -612,7 +658,12 @@ class InteractiveGestureLSM(GestureLSM):
                     listener_window[:, -actual_len:, :] = listener_latents[:, listener_start:listener_end, :]
             else:
                 listener_window = listener_latents[:, listener_start:listener_end, :]
-            listener_window = self.apply_listener_dropout(listener_window)
+        
+        # 同步 dropout：音频和 listener 使用同一个 mask
+        audio_features_flow, listener_window_flow, _ = self.apply_joint_dropout(
+            audio_window[:flow_batch_size], 
+            listener_window[:flow_batch_size] if listener_window is not None else None
+        )
         
         full_input_4d = x_t.reshape(batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
         model_output = self.denoiser(
@@ -620,7 +671,7 @@ class InteractiveGestureLSM(GestureLSM):
             timesteps=t_values[:flow_batch_size, 0],
             seed=condition_dict['y']['seed'][:flow_batch_size],
             at_feat=audio_features_flow,
-            listener_latent=listener_window[:flow_batch_size] if listener_window is not None else None
+            listener_latent=listener_window_flow
         )
         model_output = model_output.permute(0, 3, 1, 2).reshape(flow_batch_size, -1, self.num_joints * self.input_dim)
         
@@ -661,11 +712,12 @@ class InteractiveGestureLSM(GestureLSM):
         window_latents = latents[cons_start:, window_start:window_end, :]
         latent_dim = window_latents.shape[-1]
         
-        context_latents = latents[cons_start:, max(0, window_start - self.context_size):window_start, :]
-        if context_latents.shape[1] < self.context_size:
-            padding = torch.zeros(cons_batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
-            context_latents = torch.cat([padding, context_latents], dim=1)
-        context_latents = self.apply_context_noise(context_latents)
+        # 注释掉 context 处理：暂时不使用 Speaker 的 context 信息
+        # context_latents = latents[cons_start:, max(0, window_start - self.context_size):window_start, :]
+        # if context_latents.shape[1] < self.context_size:
+        #     padding = torch.zeros(cons_batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
+        #     context_latents = torch.cat([padding, context_latents], dim=1)
+        # context_latents = self.apply_context_noise(context_latents)
         
         seed = condition_dict['y']['seed'][cons_start:]
         
@@ -679,7 +731,7 @@ class InteractiveGestureLSM(GestureLSM):
         t_coef = reshape_coefs(t)
         x_t = t_coef * window_latents + (1 - t_coef) * x0_noise
         
-        force_cfg = np.random.choice([True, False], size=cons_batch_size, p=[0.8, 0.2])
+        force_cfg = np.random.choice([True, False], size=cons_batch_size, p=[self.force_cfg_prob, 1 - self.force_cfg_prob])
         
         audio_window = audio_features[cons_start:, window_start:window_end, :]
         audio_window_len = audio_window.shape[1]
@@ -687,7 +739,6 @@ class InteractiveGestureLSM(GestureLSM):
         if audio_window_len < target_audio_len:
             padding = torch.zeros(cons_batch_size, target_audio_len - audio_window_len, audio_features.shape[-1], device=device)
             audio_window = torch.cat([audio_window, padding], dim=1)
-        audio_features_cons = self._apply_force_cfg(audio_window, force_cfg)
         
         listener_window = None
         if listener_latents is not None and self.use_listener_feedback:
@@ -701,6 +752,11 @@ class InteractiveGestureLSM(GestureLSM):
             else:
                 listener_window = listener_latents[cons_start:, listener_start:listener_end, :]
         
+        # 同步 CFG：音频和 listener 使用同一个 force_cfg mask
+        audio_features_cons, listener_window_cons = self._apply_joint_force_cfg(
+            audio_window, listener_window, force_cfg
+        )
+        
         full_input_4d = x_t.reshape(cons_batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
         
         with torch.no_grad():
@@ -710,7 +766,7 @@ class InteractiveGestureLSM(GestureLSM):
                 seed=seed,
                 at_feat=audio_features_cons,
                 cond_time=d,
-                listener_latent=listener_window
+                listener_latent=listener_window_cons
             )
             pred_t = pred_t.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
             pred_t_window = pred_t
@@ -730,7 +786,7 @@ class InteractiveGestureLSM(GestureLSM):
                 seed=seed,
                 at_feat=audio_features_cons,
                 cond_time=d,
-                listener_latent=listener_window
+                listener_latent=listener_window_cons
             )
             pred_td = pred_td.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
             pred_td_window = pred_td
@@ -748,7 +804,7 @@ class InteractiveGestureLSM(GestureLSM):
             seed=seed,
             at_feat=audio_features_cons,
             cond_time=2 * d,
-            listener_latent=listener_window
+            listener_latent=listener_window_cons
         )
         model_pred = model_pred.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
         model_pred_window = model_pred
@@ -777,6 +833,41 @@ class InteractiveGestureLSM(GestureLSM):
             at_feat_forced[force_cfg_tensor] = null_cond_embed.unsqueeze(0).expand(force_cfg_tensor.sum(), -1, -1)
         
         return at_feat_forced
+    
+    def _apply_joint_force_cfg(self, audio_feat, listener_feat, force_cfg):
+        """
+        同步强制 CFG：音频和 listener 使用同一个 force_cfg mask
+        
+        Args:
+            audio_feat: [batch, seq_len, audio_dim] 音频特征
+            listener_feat: [batch, context_size, listener_dim] listener 特征
+            force_cfg: 布尔数组，指示哪些样本需要强制使用 null embedding
+        
+        Returns:
+            audio_forced: 可能被替换为 null 的音频特征
+            listener_forced: 可能被替换为 null 的 listener 特征
+        """
+        batch_size = audio_feat.shape[0]
+        target_seq_len = audio_feat.shape[1]
+        target_feat_dim = audio_feat.shape[2]
+        null_cond_embed = self.denoiser.get_null_cond_embed(target_seq_len, target_feat_dim, audio_feat.device)
+        
+        audio_forced = audio_feat.clone()
+        force_cfg_tensor = torch.tensor(force_cfg, device=audio_feat.device)
+        if force_cfg_tensor.sum() > 0:
+            audio_forced[force_cfg_tensor] = null_cond_embed.unsqueeze(0).expand(force_cfg_tensor.sum(), -1, -1)
+        
+        if listener_feat is not None:
+            listener_seq_len = listener_feat.shape[1]
+            null_listener = self.null_listener_embed.expand(listener_seq_len, -1)
+            
+            listener_forced = listener_feat.clone()
+            if force_cfg_tensor.sum() > 0:
+                listener_forced[force_cfg_tensor] = null_listener.unsqueeze(0).expand(force_cfg_tensor.sum(), -1, -1)
+        else:
+            listener_forced = None
+        
+        return audio_forced, listener_forced
     
     def _get_inference_t_values(self, batch_size, window_size, t_start, device):
         t_values = []
@@ -910,13 +1001,14 @@ class InteractiveGestureLSM(GestureLSM):
             for i in range(frames_to_generate):
                 generated_sequence.append(output_frames[:, i, :])
             
-            self.context_buffer = torch.cat([
-                self.context_buffer[:, frames_to_generate:, :],
-                output_frames
-            ], dim=1)
-            
-            if self.context_buffer.shape[1] > self.context_size:
-                self.context_buffer = self.context_buffer[:, -self.context_size:, :]
+            # 注释掉 context_buffer 滚动：暂时不使用 Speaker 的 context 信息
+            # self.context_buffer = torch.cat([
+            #     self.context_buffer[:, frames_to_generate:, :],
+            #     output_frames
+            # ], dim=1)
+            # 
+            # if self.context_buffer.shape[1] > self.context_size:
+            #     self.context_buffer = self.context_buffer[:, -self.context_size:, :]
             
             if t_0_l == 0:
                 self.window_buffer = torch.randn(
@@ -986,7 +1078,10 @@ class InteractiveGestureLSM(GestureLSM):
         
         listener_doubled = None
         if listener_window is not None:
-            listener_doubled = torch.cat([listener_window, listener_window], dim=0)
+            null_listener = self.null_listener_embed.expand(listener_window.shape[1], -1)
+            listener_cond = listener_window
+            listener_uncond = null_listener.unsqueeze(0).expand(batch_size, -1, -1)
+            listener_doubled = torch.cat([listener_cond, listener_uncond], dim=0)
         
         if t_values.dim() == 2:
             timesteps_doubled = torch.cat([t_values[:, 0], t_values[:, 0]], dim=0)
@@ -1031,7 +1126,7 @@ class InteractiveGestureLSM(GestureLSM):
         self.window_buffer = torch.randn(
             batch_size, T, self.input_dim * self.num_joints, device=device
         )
-        self.context_buffer = seed.clone()
+        # self.context_buffer = seed.clone()
         
         generated_sequence = []
         for i in range(pre_frames):
@@ -1141,12 +1236,13 @@ class InteractiveGestureLSM(GestureLSM):
             clean_frame = window_full[:, 0:1, :]
             generated_sequence.append(clean_frame.squeeze(1))
             
-            self.context_buffer = torch.cat([
-                self.context_buffer[:, 1:, :],
-                clean_frame
-            ], dim=1)
-            if self.context_buffer.shape[1] > self.context_size:
-                self.context_buffer = self.context_buffer[:, -self.context_size:, :]
+            # 注释掉 context_buffer 滚动：暂时不使用 Speaker 的 context 信息
+            # self.context_buffer = torch.cat([
+            #     self.context_buffer[:, 1:, :],
+            #     clean_frame
+            # ], dim=1)
+            # if self.context_buffer.shape[1] > self.context_size:
+            #     self.context_buffer = self.context_buffer[:, -self.context_size:, :]
             
             window_remain = window_full[:, 1:, :]
             
@@ -1213,7 +1309,10 @@ class InteractiveGestureLSM(GestureLSM):
         
         listener_doubled = None
         if listener_window is not None:
-            listener_doubled = torch.cat([listener_window, listener_window], dim=0)
+            null_listener = self.null_listener_embed.expand(listener_window.shape[1], -1)
+            listener_cond = listener_window
+            listener_uncond = null_listener.unsqueeze(0).expand(batch_size, -1, -1)
+            listener_doubled = torch.cat([listener_cond, listener_uncond], dim=0)
         
         timesteps_doubled = torch.cat([t_values[:, 0], t_values[:, 0]], dim=0)
         
@@ -1254,7 +1353,7 @@ class InteractiveGestureLSM(GestureLSM):
         self.window_buffer = torch.randn(
             batch_size, T, self.input_dim * self.num_joints, device=device
         )
-        self.context_buffer = seed.clone()
+        # self.context_buffer = seed.clone()
         
         generated_sequence = []
         for i in range(pre_frames):
@@ -1320,12 +1419,12 @@ class InteractiveGestureLSM(GestureLSM):
             output_frame = self.window_buffer[:, 0:1, :]
             generated_sequence.append(output_frame.squeeze(1))
             
-            self.context_buffer = torch.cat([
-                self.context_buffer[:, 1:, :],
-                output_frame
-            ], dim=1)
-            if self.context_buffer.shape[1] > pre_frames:
-                self.context_buffer = self.context_buffer[:, -pre_frames:, :]
+            # self.context_buffer = torch.cat([
+            #     self.context_buffer[:, 1:, :],
+            #     output_frame
+            # ], dim=1)
+            # if self.context_buffer.shape[1] > pre_frames:
+            #     self.context_buffer = self.context_buffer[:, -pre_frames:, :]
             
             self.window_buffer = torch.cat([
                 self.window_buffer[:, 1:, :],
@@ -1423,13 +1522,14 @@ class InteractiveGestureLSM(GestureLSM):
             for i in range(frames_to_generate):
                 generated_sequence.append(output_frames[:, i, :])
             
-            self.context_buffer = torch.cat([
-                self.context_buffer[:, frames_to_generate:, :],
-                output_frames
-            ], dim=1)
-            
-            if self.context_buffer.shape[1] > self.context_size:
-                self.context_buffer = self.context_buffer[:, -self.context_size:, :]
+            # 注释掉 context_buffer 滚动：暂时不使用 Speaker 的 context 信息
+            # self.context_buffer = torch.cat([
+            #     self.context_buffer[:, frames_to_generate:, :],
+            #     output_frames
+            # ], dim=1)
+            # 
+            # if self.context_buffer.shape[1] > self.context_size:
+            #     self.context_buffer = self.context_buffer[:, -self.context_size:, :]
             
             self.window_buffer = torch.randn(
                 batch_size, self.window_size, self.input_dim * self.num_joints, device=device
@@ -1518,13 +1618,14 @@ class InteractiveGestureLSM(GestureLSM):
             for i in range(frames_to_generate):
                 generated_sequence.append(output_frames[:, i, :])
             
-            self.context_buffer = torch.cat([
-                self.context_buffer[:, frames_to_generate:, :],
-                output_frames
-            ], dim=1)
-            
-            if self.context_buffer.shape[1] > self.context_size:
-                self.context_buffer = self.context_buffer[:, -self.context_size:, :]
+            # 注释掉 context_buffer 滚动：暂时不使用 Speaker 的 context 信息
+            # self.context_buffer = torch.cat([
+            #     self.context_buffer[:, frames_to_generate:, :],
+            #     output_frames
+            # ], dim=1)
+            # 
+            # if self.context_buffer.shape[1] > self.context_size:
+            #     self.context_buffer = self.context_buffer[:, -self.context_size:, :]
             
             self.window_buffer = torch.randn(
                 batch_size, self.window_size, self.input_dim * self.num_joints, device=device
@@ -1626,13 +1727,14 @@ class InteractiveGestureLSM(GestureLSM):
             for i in range(frames_to_generate):
                 generated_sequence.append(output_frames[:, i, :])
             
-            self.context_buffer = torch.cat([
-                self.context_buffer[:, frames_to_generate:, :],
-                output_frames
-            ], dim=1)
-            
-            if self.context_buffer.shape[1] > pre_frames:
-                self.context_buffer = self.context_buffer[:, -pre_frames:, :]
+            # 注释掉 context_buffer 滚动：暂时不使用 Speaker 的 context 信息
+            # self.context_buffer = torch.cat([
+            #     self.context_buffer[:, frames_to_generate:, :],
+            #     output_frames
+            # ], dim=1)
+            # 
+            # if self.context_buffer.shape[1] > pre_frames:
+            #     self.context_buffer = self.context_buffer[:, -pre_frames:, :]
             
             if t_0_l == 0:
                 self.window_buffer = torch.randn(
@@ -1672,7 +1774,10 @@ class InteractiveGestureLSM(GestureLSM):
         
         listener_doubled = None
         if listener_window is not None:
-            listener_doubled = torch.cat([listener_window, listener_window], dim=0)
+            null_listener = self.null_listener_embed.expand(listener_window.shape[1], -1)
+            listener_cond = listener_window
+            listener_uncond = null_listener.unsqueeze(0).expand(batch_size, -1, -1)
+            listener_doubled = torch.cat([listener_cond, listener_uncond], dim=0)
         
         timesteps_doubled = torch.full((batch_size * 2,), t, device=x.device)
         
