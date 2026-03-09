@@ -12,7 +12,7 @@ root_path: ./
 data_path: ./datasets/seamless_interaction/improvised/
 data_path_1: ./datasets/hub/
 # dataset: seamless_sep
-cache_path: datasets/seamless_cache/seamless_smplh_64/ #64 24 144
+cache_path: datasets/seamless_cache/seamless_smplh_32/ #64 24 144
 new_cache: False
 
 # 运动配置 - 专为RVQ训练优化
@@ -25,9 +25,9 @@ pose_fps: 30
 # pre_frames: 4
 # pose_dims: 312
 
-pose_length: 64 ##64 24 144
-stride: 40 #20 8 45
-test_length: 64 ##64 24 144
+pose_length: 32 ##64 24 144
+stride: 20 #40 20 8 45
+test_length: 32 ##64 24 144
 multi_length_training: [1.0]  # 恢复单一长度训练
 
 # motion_f: 256

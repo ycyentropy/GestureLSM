@@ -128,6 +128,53 @@ class ReConsLoss(nn.Module):
 
         return jitter_loss
 
+def sliding_window_inference(net, gt_motion, mask, window_size=64, window_stride=32, device='cuda'):
+    """
+    滑动窗口推理函数，模拟伪流式生成
+    每个窗口独立推理，直接输出结果，不做重叠区域平滑
+    
+    Args:
+        net: RVQVAE模型
+        gt_motion: 输入运动数据 [1, T, D]
+        mask: 关节掩码
+        window_size: 窗口大小
+        window_stride: 窗口步长
+        device: 设备
+    
+    Returns:
+        pred_motion: 重建的运动数据 [1, T, D_masked]
+    """
+    T = gt_motion.shape[1]
+    
+    if T <= window_size:
+        gt_motion_masked = gt_motion[..., mask]
+        pred_motion, _, _ = net(gt_motion_masked).values()
+        return pred_motion
+    
+    num_windows = (T - window_size) // window_stride + 1
+    
+    pred_all = torch.zeros_like(gt_motion[..., mask])
+    
+    for i in range(num_windows):
+        start_idx = i * window_stride
+        end_idx = start_idx + window_size
+        
+        if end_idx > T:
+            end_idx = T
+            start_idx = T - window_size
+        
+        window_motion = gt_motion[:, start_idx:end_idx, :]
+        window_masked = window_motion[..., mask]
+        
+        pred_window, _, _ = net(window_masked).values()
+        
+        if i == 0:
+            pred_all[:, start_idx:end_idx, :] = pred_window
+        else:
+            pred_all[:, start_idx + (window_size - window_stride):end_idx, :] = pred_window[:, (window_size - window_stride):, :]
+    
+    return pred_all
+
 import argparse
 
 def get_args_parser():
@@ -148,7 +195,7 @@ def get_args_parser():
     parser.add_argument('--gamma', default=0.1, type=float, help="learning rate decay")
 
     parser.add_argument('--weight-decay', default=0.0, type=float, help='weight decay')
-    parser.add_argument("--commit", type=float, default=0.2, help="hyper-parameter for the commitment loss")
+    parser.add_argument("--commit", type=float, default=0.1, help="hyper-parameter for the commitment loss 0.2")
     # parser.add_argument('--loss-vel', type=float, default=0.1, help='hyper-parameter for the velocity loss')
     # parser.add_argument('--use-jitter-loss', action='store_true', help='use jitter loss instead of velocity loss for better smoothness')
     parser.add_argument('--recons-loss', type=str, default='l1_smooth', help='reconstruction loss')
@@ -191,6 +238,10 @@ def get_args_parser():
     parser.add_argument('--rebuild-cache', action='store_true', help='force rebuild cache even if exists')
     parser.add_argument('--cache-only', action='store_true', help='only build cache, do not train')
     parser.add_argument('--gpu-id', type=int, default=0, help='GPU ID to use for training')
+
+    parser.add_argument('--sliding-window', action='store_true', help='use sliding window inference for evaluation')
+    parser.add_argument('--window-stride', type=int, default=16, help='sliding window stride for inference')
+    parser.add_argument('--max-val-samples', type=int, default=10, help='maximum number of validation samples (None for all)')
 
 
     return parser.parse_args()
@@ -266,9 +317,8 @@ logger.info("="*60)
 train_loader = torch.utils.data.DataLoader(trainSet,
                                               args.batch_size,
                                               shuffle=True,
-                                              num_workers=2,
-                                              drop_last = True,
-                                              persistent_workers=True)
+                                              num_workers=0,
+                                              drop_last = True)
 test_loader = torch.utils.data.DataLoader(testSet,
                                           1,
                                             shuffle=False,
@@ -533,6 +583,8 @@ if args.mode == 'train':
             lvel = 0
 
             logger.info(f"Evaluating at iteration {nb_iter}...")
+            if args.sliding_window:
+                logger.info(f"Using sliding window inference: window_size={args.window_size}, stride={args.window_stride}")
 
             latent_out = []
             latent_ori = []
@@ -540,6 +592,8 @@ if args.mode == 'train':
 
             with torch.no_grad():
                 for its, batch_data in enumerate(test_loader):
+                    if args.max_val_samples is not None and its >= args.max_val_samples:
+                        break
                     gt_motion = batch_data.to(device).float()
                     n = gt_motion.shape[1]
                     remain = n%8
@@ -548,27 +602,31 @@ if args.mode == 'train':
                         gt_motion = gt_motion[:, :-remain, :]
 
                     gt_ori = gt_motion.clone()
-                    gt_motion = gt_motion[...,mask] # (bs, 64, dim)
-                    bs = gt_motion.shape[0]
-                    pred_motion, loss_commit, perplexity = net(gt_motion).values()
-                    diff = pred_motion - gt_motion
+                    
+                    if args.sliding_window:
+                        pred_motion = sliding_window_inference(
+                            net, gt_motion, mask, 
+                            window_size=args.window_size, 
+                            window_stride=args.window_stride,
+                            device=device
+                        )
+                    else:
+                        gt_motion_masked = gt_motion[...,mask]
+                        pred_motion, _, _ = net(gt_motion_masked).values()
+                    
+                    diff = pred_motion - gt_motion[..., mask]
 
-                    # pred_motion = pred_motion
                     rec_motion = gt_ori.clone()
-
-                    rec_motion[..., mask] = pred_motion # it is already a 6d tensor
+                    rec_motion[..., mask] = pred_motion
 
                     n = rec_motion.shape[1]
 
-                    # 简化重建 - 只应用反归一化到掩码部分
-                    rec_motion_part = rec_motion[..., :-103] * std_pose + mean_pose #把mask改成:-103
+                    rec_motion_part = rec_motion[..., :-103] * std_pose + mean_pose
                     gt_motion_part = gt_ori[..., :-103] * std_pose + mean_pose
 
-                    # 计算L2距离
                     l2_batch = torch.sqrt(torch.sum(diff ** 2, dim=[1, 2])).mean().item()
                     l2_all += l2_batch
 
-                    # 收集潜在表示用于FID计算
                     remain = n % 32
                     latent_out.append(eval_copy.map2latent(rec_motion_part[:, :n-remain]).reshape(-1, 32).detach().cpu().numpy())
                     latent_ori.append(eval_copy.map2latent(gt_motion_part[:, :n-remain]).reshape(-1, 32).detach().cpu().numpy())
@@ -581,8 +639,9 @@ if args.mode == 'train':
                 fid = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
                 logger.info(f"FID: {fid:.6f}")
 
-                avg_l2 = l2_all / len(test_loader)
-                logger.info(f"Iteration {nb_iter}: L2 distance: {avg_l2:.6f}")
+                actual_samples = its if args.max_val_samples is not None else len(test_loader)
+                avg_l2 = l2_all / actual_samples
+                logger.info(f"Iteration {nb_iter}: L2 distance: {avg_l2:.6f} (evaluated on {actual_samples} samples)")
 
                 # Add current L2 to history
                 l2_history.append(avg_l2)
@@ -674,6 +733,8 @@ else:
     lvel = 0
 
     logger.info("Running evaluation...")
+    if args.sliding_window:
+        logger.info(f"Using sliding window inference: window_size={args.window_size}, stride={args.window_stride}")
 
     latent_out = []
     latent_ori = []
@@ -681,6 +742,8 @@ else:
 
     with torch.no_grad():
         for its, batch_data in enumerate(test_loader):
+            if args.max_val_samples is not None and its >= args.max_val_samples:
+                break
             gt_motion = batch_data.to(device).float()
             n = gt_motion.shape[1]
             remain = n%8
@@ -689,25 +752,31 @@ else:
                 gt_motion = gt_motion[:, :-remain, :]
 
             gt_ori = gt_motion.clone()
-            gt_motion = gt_motion[...,mask] # (bs, 64, dim)
-            pred_motion, loss_commit, perplexity = net(gt_motion).values()
-            diff = pred_motion - gt_motion
+            
+            if args.sliding_window:
+                pred_motion = sliding_window_inference(
+                    net, gt_motion, mask, 
+                    window_size=args.window_size, 
+                    window_stride=args.window_stride,
+                    device=device
+                )
+            else:
+                gt_motion_masked = gt_motion[...,mask]
+                pred_motion, _, _ = net(gt_motion_masked).values()
+            
+            diff = pred_motion - gt_motion[..., mask]
 
-            # pred_motion = pred_motion
             rec_motion = gt_ori.clone()
-
-            rec_motion[..., mask] = pred_motion # it is already a 6d tensor
+            rec_motion[..., mask] = pred_motion
 
             n = rec_motion.shape[1]
 
-            # 简化重建 - 只应用反归一化到掩码部分
-            rec_motion_part = rec_motion[..., :-103] * std_pose + mean_pose #把mask改成:-103
+            rec_motion_part = rec_motion[..., :-103] * std_pose + mean_pose
             gt_motion_part = gt_ori[..., :-103] * std_pose + mean_pose
 
             l2_batch = torch.sqrt(torch.sum(diff ** 2, dim=[1, 2])).mean().item()
             l2_all += l2_batch
 
-            # 收集潜在表示用于FID计算
             remain = n % 32
             latent_out.append(eval_copy.map2latent(rec_motion_part[:, :n-remain]).reshape(-1, 240).detach().cpu().numpy())
             latent_ori.append(eval_copy.map2latent(gt_motion_part[:, :n-remain]).reshape(-1, 240).detach().cpu().numpy())
@@ -720,7 +789,8 @@ else:
         fid = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
         logger.info(f"Evaluation FID: {fid:.6f}")
 
-        avg_l2 = l2_all / len(test_loader)
-        logger.info(f"Evaluation L2 distance: {avg_l2:.6f}")
+        actual_samples = its if args.max_val_samples is not None else len(test_loader)
+        avg_l2 = l2_all / actual_samples
+        logger.info(f"Evaluation L2 distance: {avg_l2:.6f} (evaluated on {actual_samples} samples)")
 
 logger.info("Script completed successfully!")

@@ -137,7 +137,7 @@ class InteractiveGestureDenoiser(nn.Module):
         
         return self.null_cond_embed.to(device)
 
-    def forward(self, x, timesteps, cond_time=None, seed=None, at_feat=None, listener_latent=None):
+    def forward(self, x, timesteps, cond_time=None, seed=None, at_feat=None, listener_latent=None, id_emb=None):
         if x.dim() == 4 and x.shape[-1] == 1:
             x = x.squeeze(-1)
 
@@ -157,6 +157,7 @@ class InteractiveGestureDenoiser(nn.Module):
         else:
             emb_t = self.time_embedding(time_emb)
         
+        # Process seed embedding
         if self.n_seed != 0 and seed is not None and self.embed_text is not None:
             if seed.ndim == 3:
                 emb_seed = self.embed_text(seed.reshape(bs_curr, -1))
@@ -164,10 +165,18 @@ class InteractiveGestureDenoiser(nn.Module):
                 emb_seed = self.embed_text(seed)
         else:
             emb_seed = 0
-
+        
+        # Process ID embedding if provided
+        if id_emb is not None:
+            # Directly use ID embedding (assuming id_embedding_dim == latent_dim)
+            emb_id = id_emb
+        else:
+            emb_id = 0
+        
         xseq = self.input_process(x)
-
-        embed_style_2 = (emb_seed + emb_t).unsqueeze(1).unsqueeze(2).expand(-1, self.joint_num, nframes, -1)
+        
+        # Combine seed, ID, and time embeddings
+        embed_style_2 = (emb_seed + emb_t + emb_id).unsqueeze(1).unsqueeze(2).expand(-1, self.joint_num, nframes, -1)
         xseq = torch.cat([embed_style_2, xseq], axis=-1)
         xseq = self.input_process2(xseq)
         

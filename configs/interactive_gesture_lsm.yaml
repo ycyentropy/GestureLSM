@@ -1,5 +1,5 @@
 wandb_project: 'GestureLSM'
-exp_name: 'interactive_gesture_lsm_3_2'
+exp_name: 'interactive_gesture_lsm_3_9_id_ladder_slice'
 
 wandb_entity: 'xxxx'
 wandb_key: "xxxxxxx"
@@ -19,10 +19,10 @@ max_val_samples: 10
 # 多卡分布式训练配置示例
 # 取消注释以下配置并注释上面的单卡配置即可启用
 # ============================================
-gpus: [0, 1, 2, 3]  # 使用的 GPU 列表
-ddp: true           # 启用分布式数据并行
-# gpus: [0,1,2,3,4,5,6,7]
-# ddp: true
+# gpus: [0, 1, 2, 3]  # 使用的 GPU 列表
+# ddp: true           # 启用分布式数据并行
+gpus: [0,1,2,3,4,5,6,7]
+ddp: true
 # 注意：多卡训练时，总 batch size = train_bs * len(gpus)
 # 例如：train_bs=64, gpus=[0,1,2,3] -> 总 batch size = 256
 
@@ -43,7 +43,7 @@ use_trans: False
 pre_frames: 4
 vqvae_squeeze_scale: 4
 vqvae_latent_scale: 1 #5
-vae_length: 240
+vae_length: 256 #240
 vae_test_len: 32
 mean_pose_path: "./mean_std_seamless/mean_pose.npy"
 std_pose_path: "./mean_std_seamless/std_pose.npy"
@@ -75,7 +75,7 @@ data:
   additional_data: False
   cache_path: ./cache/dyadic_feedback
   cache_dir: ./cache/dyadic_feedback
-  new_cache: False
+  new_cache: False  # 强制重新构建缓存
   disable_filtering: False
   clean_first_seconds: 0
   clean_final_seconds: 0
@@ -96,9 +96,9 @@ model:
   g_name: InteractiveGestureLSM
   do_classifier_free_guidance: True
   guidance_scale: 2.0
-  n_steps: 12
+  n_steps: 3 #12
   use_exp: False
-  use_id: False
+  use_id: true #False
   max_id: 5000
   id_embedding_dim: 256
   
@@ -113,7 +113,7 @@ model:
       dropout: 0.2 #0.1
       activation: "gelu"
       n_seed: 4 #8 #只有 pre_frames 和 n_seed 必须一致
-      seq_len: 10 # window_size
+      seq_len: 12 # window_size
       flip_sin_to_cos: True
       freq_shift: 0.0
       cond_proj_dim: 256 #512
@@ -139,7 +139,7 @@ model:
 
   window_size: 12 #24
   context_size: 4 #4 #8
-  ladder_step: 1 #4
+  ladder_step: 4 #4
   # noise_range: [0, 1]
   
   # 实时模式：Listener 使用历史动作而非未来动作
@@ -148,7 +148,7 @@ model:
   
   # 是否使用 Listener 反馈（消融实验用）
   # 设为 false 可禁用 Listener 视觉反馈，仅使用音频生成动作
-  use_listener_feedback: true #true
+  use_listener_feedback: true
   
   inertia_weight: 0
   ofs_threshold: 1 #0.8
@@ -171,11 +171,40 @@ model:
   # 1.0: 始终使用预测值
   # 推荐值: 0.1-0.3，逐步增加
   scheduled_sampling_prob: 0 #0.3
-
+  
+  # ============================================
+  # Seed 噪声模拟（解决 Exposure Bias 问题）
+  # ============================================
+  # 训练时为滚动阶段的 seed 添加噪声，模拟推理时的预测误差
+  # seed_noise_prob: 滚动阶段添加噪声的概率（0.0 = 禁用）
+  # seed_noise_level: 噪声水平范围 [min, max]（当不使用 error_stats 时生效）
+  # error_stats_path: 预计算的误差统计文件路径（推荐，用于结构化噪声）
+  seed_noise_prob: 0.2       # 先禁用，等模型稳定后再开启
+  seed_noise_level: [0.05, 0.1]  # 降低噪声水平
+  # error_stats_path: "./error_statistics.pt"  # 使用收集的误差统计
+  
+  # ============================================
+  # Seed 渐进式融合（解决 Exposure Bias 问题）
+  # ============================================
+  # 推理时将 GT seed 和预测 seed 渐进融合，避免突然切换
+  # seed_blend_mode: 融合模式 ("none", "linear", "exponential", "cosine")
+  #   - none: 不融合，直接使用预测值
+  #   - linear: 线性衰减 α = 1 - progress
+  #   - exponential: 指数衰减 α = exp(-3 * progress)
+  #   - cosine: 余弦衰减 α = 0.5 * (1 + cos(π * progress))
+  # seed_blend_warmup: 融合过渡的帧数（从全 GT 过渡到全预测值）
+  seed_blend_mode: "cosine"  # 推荐使用 cosine
+  seed_blend_warmup: 100     # 100 帧内完成过渡
+  
+  # use_gt_seed_inference: 推理时是否使用 GT seed（oracle 模式）
+  #   - false: 使用预测值作为 seed（正常推理模式）
+  #   - true: 始终使用 GT seed（oracle 模式，用于对比实验）
+  use_gt_seed_inference: true #false
+  
   use_dual_phase: true      # 启用双阶段调度（训练时）
   pre_roll_prob: 0.2        # 预滚动阶段采样概率
-  pre_roll_steps: 12        # 预滚动阶段去噪步数（独立于 window_size）
-  inference_mode: "rflav"   # 推理模式: "rflav" 或 "rdla"
+  pre_roll_steps: 3        # 预滚动阶段去噪步数（独立于 window_size） 12
+  inference_mode: "rflav_ladder"   # 推理模式: "rflav" 或 "rdla" 或 "rflav_ladder" 或 "sliding_window"
   
   # 时间步加权模式（消融实验用）
   # "none": 无加权（默认）

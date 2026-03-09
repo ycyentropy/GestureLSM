@@ -1,3 +1,4 @@
+import os
 import random
 import torch
 import torch.nn as nn
@@ -42,7 +43,6 @@ class OnlineListenerLoader:
         listener_end = frame_idx
         
         if listener_end - listener_start < self.context_size:
-            # 历史不足，用零填充（右对齐）
             listener_window = torch.zeros(
                 self.batch_size, self.context_size, self.latent_dim,
                 device=self.device
@@ -117,6 +117,149 @@ class InteractiveGestureLSM(GestureLSM):
         self.timestep_weight_scale = cfg.model.get("timestep_weight_scale", 1.0)
         if self.timestep_weighting != "none":
             logger.info(f"Timestep weighting enabled: mode={self.timestep_weighting}, scale={self.timestep_weight_scale}")
+        
+        self.seed_noise_prob = cfg.model.get("seed_noise_prob", 0.0)
+        self.seed_noise_level = cfg.model.get("seed_noise_level", [0.05, 0.15])
+        self.error_stats_path = cfg.model.get("error_stats_path", None)
+        self.error_stats = None
+        
+        self.seed_blend_mode = cfg.model.get("seed_blend_mode", "none")
+        self.seed_blend_warmup = cfg.model.get("seed_blend_warmup", 100)
+        
+        self.use_gt_seed_inference = cfg.model.get("use_gt_seed_inference", False)
+        
+        if self.seed_noise_prob > 0:
+            logger.info(f"Seed noise simulation enabled: prob={self.seed_noise_prob}, level={self.seed_noise_level}")
+        
+        if self.seed_blend_mode != "none":
+            logger.info(f"Seed blending enabled: mode={self.seed_blend_mode}, warmup={self.seed_blend_warmup}")
+        
+        if self.use_gt_seed_inference:
+            logger.info("Using GT seed during inference (oracle mode)")
+        
+        if self.error_stats_path is not None and os.path.exists(self.error_stats_path):
+            self._load_error_stats(self.error_stats_path)
+    
+    def _load_error_stats(self, path):
+        """加载误差统计信息"""
+        logger.info(f"Loading error statistics from {path}")
+        self.error_stats = torch.load(path, map_location='cpu')
+        if 'global_seed_error' in self.error_stats:
+            stats = self.error_stats['global_seed_error']
+            logger.info(f"Global seed error L2: {stats['l2_mean']:.4f} ± {stats['l2_std']:.4f}")
+    
+    def _get_id_embedding(self, condition_dict, batch_size=None):
+        """
+        从 condition_dict 中提取 ID embedding
+        
+        Args:
+            condition_dict: 包含 ID 信息的字典
+            batch_size: 可选的 batch size，用于切片
+        
+        Returns:
+            id_emb: ID embedding [batch, id_embedding_dim] 或 None
+        """
+        if not self.use_id or 'y' not in condition_dict or 'id' not in condition_dict['y']:
+            return None
+        
+        instance_ids = condition_dict['y']['id']
+        if len(instance_ids.shape) > 1:
+            first_frame_id = instance_ids[:, 0]
+            if len(first_frame_id.shape) > 1:
+                first_frame_id = torch.argmax(first_frame_id, dim=-1)
+        else:
+            first_frame_id = instance_ids
+        
+        id_idx = torch.clamp(first_frame_id, 0, self.max_id - 1).long()
+        id_emb = self.id_embeddings(id_idx)
+        
+        if batch_size is not None and id_emb.shape[0] > batch_size:
+            id_emb = id_emb[:batch_size]
+        
+        return id_emb
+    
+    def _get_blend_alpha(self, frame_idx, pre_frames, total_frames):
+        """
+        计算 GT seed 和预测 seed 的融合权重
+        
+        Args:
+            frame_idx: 当前帧索引
+            pre_frames: seed 帧数
+            total_frames: 总帧数
+        
+        Returns:
+            alpha: GT seed 的权重 (0.0 ~ 1.0)
+        """
+        relative_pos = frame_idx - pre_frames
+        total_gen_frames = total_frames - pre_frames
+        
+        if relative_pos <= 0:
+            return 1.0
+        
+        if self.seed_blend_mode == "none":
+            return 0.0
+        
+        warmup = min(self.seed_blend_warmup, total_gen_frames)
+        
+        if relative_pos >= warmup:
+            return 0.0
+        
+        progress = relative_pos / warmup
+        
+        if self.seed_blend_mode == "linear":
+            return 1.0 - progress
+        elif self.seed_blend_mode == "exponential":
+            return np.exp(-3.0 * progress)
+        elif self.seed_blend_mode == "cosine":
+            return 0.5 * (1.0 + np.cos(np.pi * progress))
+        else:
+            return 1.0 - progress
+    
+    def _blend_seed_with_prediction(self, gt_seed, pred_seed, alpha):
+        """
+        融合 GT seed 和预测 seed
+        
+        Args:
+            gt_seed: [batch, pre_frames, latent_dim] GT seed
+            pred_seed: [batch, pre_frames, latent_dim] 预测的 seed
+            alpha: GT seed 的权重
+        
+        Returns:
+            blended_seed: 融合后的 seed
+        """
+        if alpha >= 1.0:
+            return gt_seed
+        elif alpha <= 0.0:
+            return pred_seed
+        else:
+            return alpha * gt_seed + (1.0 - alpha) * pred_seed
+    
+    def _add_seed_noise(self, seed, position=None):
+        """
+        为 seed 添加噪声以模拟推理误差
+        
+        Args:
+            seed: [batch, pre_frames, latent_dim] GT seed
+            position: 当前帧位置（用于位置相关的误差统计）
+        
+        Returns:
+            noisy_seed: 添加噪声后的 seed
+        """
+        batch_size = seed.shape[0]
+        device = seed.device
+        
+        if self.error_stats is not None and position is not None:
+            pos_key = int(position)
+            if pos_key in self.error_stats.get('seed_errors', {}):
+                stats = self.error_stats['seed_errors'][pos_key]
+                mean = torch.from_numpy(stats['mean']).to(device)
+                std = torch.from_numpy(stats['std']).to(device)
+                noise = torch.randn_like(seed) * std + mean
+                return seed + noise
+        
+        noise_level = random.uniform(self.seed_noise_level[0], self.seed_noise_level[1])
+        noise = torch.randn_like(seed) * noise_level
+        return seed + noise
     
     def init_rolling_window(self, batch_size, device, idle_pose=None):
         self.window_buffer = torch.randn(
@@ -138,6 +281,9 @@ class InteractiveGestureLSM(GestureLSM):
         """
         应用滚动噪声调度
         
+        Args:
+            use_ladder: 是否使用阶梯式时间步调度（与 dual_phase 兼容）
+        
         Returns:
             x_t: 加噪后的数据
             t_values: 时间步序列
@@ -145,7 +291,7 @@ class InteractiveGestureLSM(GestureLSM):
             phase_mask: 阶段掩码 (True=预滚动阶段, False=滚动阶段)
         """
         if self.use_dual_phase:
-            return self._apply_dual_phase_noise(x0, batch_size, device)
+            return self._apply_dual_phase_noise(x0, batch_size, device, use_ladder=use_ladder)
         elif use_ladder and self.ladder_step > 1:
             x_t, t_values, noise = self._apply_ladder_noise(x0, batch_size, device)
             phase_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -169,7 +315,7 @@ class InteractiveGestureLSM(GestureLSM):
         x_t = t_coef * x0 + (1 - t_coef) * noise
         return x_t, t_values, noise
     
-    def _get_pre_rolling_timesteps(self, batch_size, device):
+    def _get_pre_rolling_timesteps(self, batch_size, device, use_ladder=False):
         """
         RFLAV 预滚动阶段时间步调度器
         
@@ -182,6 +328,7 @@ class InteractiveGestureLSM(GestureLSM):
         Args:
             batch_size: 批次大小
             device: 设备
+            use_ladder: 是否使用阶梯式时间步
             
         Returns:
             t_values: [batch_size, window_size] 时间步序列
@@ -190,12 +337,19 @@ class InteractiveGestureLSM(GestureLSM):
         w = torch.rand(batch_size, device=device)
         
         k = torch.arange(T, device=device).float().unsqueeze(0)
-        t_values = 1.0 - (k / T + w.unsqueeze(1))
+        
+        if use_ladder and self.ladder_step > 1:
+            l = self.ladder_step
+            k_ladder = (k / l).floor() * l
+            t_values = 1.0 - (k_ladder / T + w.unsqueeze(1))
+        else:
+            t_values = 1.0 - (k / T + w.unsqueeze(1))
+        
         t_values = torch.clamp(t_values, min=0.0, max=1.0)
         
         return t_values
     
-    def _get_rolling_timesteps(self, batch_size, device):
+    def _get_rolling_timesteps(self, batch_size, device, use_ladder=False):
         """
         RFLAV 滚动阶段时间步调度器
         
@@ -210,6 +364,7 @@ class InteractiveGestureLSM(GestureLSM):
         Args:
             batch_size: 批次大小
             device: 设备
+            use_ladder: 是否使用阶梯式时间步
             
         Returns:
             t_values: [batch_size, window_size] 时间步序列
@@ -218,11 +373,19 @@ class InteractiveGestureLSM(GestureLSM):
         w = torch.rand(batch_size, device=device)
         
         k = torch.arange(T, device=device).float().unsqueeze(0)
-        t_values = 1.0 - (k + w.unsqueeze(1)) / T
+        
+        if use_ladder and self.ladder_step > 1:
+            l = self.ladder_step
+            num_ladders = T // l
+            ladder_idx = k // l
+            t_0_l = torch.randint(1, num_ladders + 1, (batch_size,), device=device).float()
+            t_values = 1.0 - (ladder_idx + (num_ladders - t_0_l.unsqueeze(1))) / num_ladders
+        else:
+            t_values = 1.0 - (k + w.unsqueeze(1)) / T
         
         return t_values
     
-    def _apply_dual_phase_noise(self, x0, batch_size, device):
+    def _apply_dual_phase_noise(self, x0, batch_size, device, use_ladder=True):
         """
         RFLAV 双阶段噪声调度
         
@@ -230,6 +393,9 @@ class InteractiveGestureLSM(GestureLSM):
         以 (1 - pre_roll_prob) 概率采样滚动阶段
         
         这确保训练覆盖推理的所有场景，避免训练-推理不一致
+        
+        Args:
+            use_ladder: 是否使用阶梯式时间步调度（与 dual_phase 兼容）
         
         Returns:
             x_t: 加噪后的数据
@@ -239,8 +405,8 @@ class InteractiveGestureLSM(GestureLSM):
         """
         phase_mask = torch.rand(batch_size, device=device) < self.pre_roll_prob
         
-        t_pre_roll = self._get_pre_rolling_timesteps(batch_size, device)
-        t_roll = self._get_rolling_timesteps(batch_size, device)
+        t_pre_roll = self._get_pre_rolling_timesteps(batch_size, device, use_ladder=use_ladder)
+        t_roll = self._get_rolling_timesteps(batch_size, device, use_ladder=use_ladder)
         
         t_values = torch.where(phase_mask.unsqueeze(1), t_pre_roll, t_roll)
         
@@ -618,11 +784,26 @@ class InteractiveGestureLSM(GestureLSM):
             condition_dict['y']['word']
         )
         
+        # Extract ID embedding for denoiser (will be added globally in denoiser)
+        id_emb_for_denoiser = None
         if self.use_id:
-            id_tensor = condition_dict['y']['id'][:, 0]
-            id_emb = self.id_embeddings(id_tensor)
-            id_emb_expanded = id_emb.unsqueeze(1).repeat(1, audio_features.shape[1], 1)
-            audio_features = torch.cat([audio_features, id_emb_expanded], dim=-1)
+            # Get the first frame's ID from the sequence
+            instance_ids = condition_dict['y']['id']
+            if len(instance_ids.shape) > 1:
+                # ID is a sequence, take the first frame's ID
+                first_frame_id = instance_ids[:, 0]
+                # If first_frame_id is still a sequence (one-hot), convert to integer index
+                if len(first_frame_id.shape) > 1:
+                    first_frame_id = torch.argmax(first_frame_id, dim=-1)
+            else:
+                # ID is already a single value per batch
+                first_frame_id = instance_ids
+            
+            # Ensure ID indices are within valid range
+            id_idx = torch.clamp(first_frame_id, 0, self.max_id - 1).long()
+            
+            # Generate ID embeddings [batch, id_embedding_dim]
+            id_emb_for_denoiser = self.id_embeddings(id_idx)
         
         window_start = pre_frames
         window_end = window_start + self.window_size
@@ -632,13 +813,6 @@ class InteractiveGestureLSM(GestureLSM):
         x_t, t_values, noise, phase_mask = self.apply_rolling_noise(
             window_latents, batch_size, device, use_ladder=True
         )
-        
-        # 注释掉 context 处理：暂时不使用 Speaker 的 context 信息
-        # context_latents = latents[:, max(0, window_start - self.context_size):window_start, :]
-        # if context_latents.shape[1] < self.context_size:
-        #     padding = torch.zeros(batch_size, self.context_size - context_latents.shape[1], latent_dim, device=device)
-        #     context_latents = torch.cat([padding, context_latents], dim=1)
-        # context_latents = self.apply_context_noise(context_latents, phase_mask)
         
         audio_window = audio_features[:, window_start:window_end, :]
         audio_window_len = audio_window.shape[1]
@@ -659,19 +833,33 @@ class InteractiveGestureLSM(GestureLSM):
             else:
                 listener_window = listener_latents[:, listener_start:listener_end, :]
         
-        # 同步 dropout：音频和 listener 使用同一个 mask
         audio_features_flow, listener_window_flow, _ = self.apply_joint_dropout(
             audio_window[:flow_batch_size], 
             listener_window[:flow_batch_size] if listener_window is not None else None
         )
         
+        seed_to_use = condition_dict['y']['seed'][:flow_batch_size].clone()
+        
+        if self.seed_noise_prob > 0 and self.training:
+            roll_mask = ~phase_mask[:flow_batch_size]
+            use_noise = (torch.rand(flow_batch_size, device=device) < self.seed_noise_prob) & roll_mask
+            
+            if use_noise.any():
+                for i in range(flow_batch_size):
+                    if use_noise[i]:
+                        seed_to_use[i:i+1] = self._add_seed_noise(
+                            seed_to_use[i:i+1], 
+                            position=window_start
+                        )
+        
         full_input_4d = x_t.reshape(batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
         model_output = self.denoiser(
             x=full_input_4d[:flow_batch_size],
             timesteps=t_values[:flow_batch_size, 0],
-            seed=condition_dict['y']['seed'][:flow_batch_size],
+            seed=seed_to_use,
             at_feat=audio_features_flow,
-            listener_latent=listener_window_flow
+            listener_latent=listener_window_flow,
+            id_emb=id_emb_for_denoiser[:flow_batch_size] if id_emb_for_denoiser is not None else None
         )
         model_output = model_output.permute(0, 3, 1, 2).reshape(flow_batch_size, -1, self.num_joints * self.input_dim)
         
@@ -721,6 +909,9 @@ class InteractiveGestureLSM(GestureLSM):
         
         seed = condition_dict['y']['seed'][cons_start:]
         
+        # Extract ID embedding for consistency loss
+        id_emb_cons = self._get_id_embedding(condition_dict, cons_batch_size)
+        
         deltas = 1 / torch.tensor([2 ** i for i in range(1, 8)]).to(device)
         delta_probs = torch.ones((deltas.shape[0],), device=device) / deltas.shape[0]
         
@@ -759,6 +950,8 @@ class InteractiveGestureLSM(GestureLSM):
         
         full_input_4d = x_t.reshape(cons_batch_size, -1, self.num_joints, self.input_dim).permute(0, 2, 3, 1)
         
+        # Use id_emb_cons extracted above
+        
         with torch.no_grad():
             pred_t = self.denoiser(
                 x=full_input_4d,
@@ -766,7 +959,8 @@ class InteractiveGestureLSM(GestureLSM):
                 seed=seed,
                 at_feat=audio_features_cons,
                 cond_time=d,
-                listener_latent=listener_window_cons
+                listener_latent=listener_window_cons,
+                id_emb=id_emb_cons
             )
             pred_t = pred_t.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
             pred_t_window = pred_t
@@ -786,7 +980,8 @@ class InteractiveGestureLSM(GestureLSM):
                 seed=seed,
                 at_feat=audio_features_cons,
                 cond_time=d,
-                listener_latent=listener_window_cons
+                listener_latent=listener_window_cons,
+                id_emb=id_emb_cons
             )
             pred_td = pred_td.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
             pred_td_window = pred_td
@@ -804,7 +999,8 @@ class InteractiveGestureLSM(GestureLSM):
             seed=seed,
             at_feat=audio_features_cons,
             cond_time=2 * d,
-            listener_latent=listener_window_cons
+            listener_latent=listener_window_cons,
+            id_emb=id_emb_cons
         )
         model_pred = model_pred.permute(0, 3, 1, 2).reshape(cons_batch_size, -1, self.num_joints * self.input_dim)
         model_pred_window = model_pred
@@ -977,12 +1173,14 @@ class InteractiveGestureLSM(GestureLSM):
                 at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
                 
                 timesteps = t_values[:, 0] if t_values.dim() == 2 else t_values
+                id_emb = self._get_id_embedding(condition_dict, batch_size)
                 v_pred = self.denoiser(
                     x=full_input_4d,
                     timesteps=timesteps,
                     seed=condition_dict['y']['seed'],
                     at_feat=at_feat,
-                    listener_latent=listener_window
+                    listener_latent=listener_window,
+                    id_emb=id_emb
                 )
             
             v_pred = v_pred.squeeze(2)
@@ -1083,6 +1281,21 @@ class InteractiveGestureLSM(GestureLSM):
             listener_uncond = null_listener.unsqueeze(0).expand(batch_size, -1, -1)
             listener_doubled = torch.cat([listener_cond, listener_uncond], dim=0)
         
+        # Process ID embedding for CFG
+        id_emb_doubled = None
+        if self.use_id:
+            instance_ids = condition_dict['y']['id']
+            if len(instance_ids.shape) > 1:
+                first_frame_id = instance_ids[:, 0]
+                if len(first_frame_id.shape) > 1:
+                    first_frame_id = torch.argmax(first_frame_id, dim=-1)
+            else:
+                first_frame_id = instance_ids
+            id_idx = torch.clamp(first_frame_id, 0, self.max_id - 1).long()
+            id_emb = self.id_embeddings(id_idx)
+            # Double ID embedding for CFG (keep conditional for both cond and uncond)
+            id_emb_doubled = torch.cat([id_emb, id_emb], dim=0)
+        
         if t_values.dim() == 2:
             timesteps_doubled = torch.cat([t_values[:, 0], t_values[:, 0]], dim=0)
         else:
@@ -1093,7 +1306,64 @@ class InteractiveGestureLSM(GestureLSM):
             timesteps=timesteps_doubled,
             seed=seed_doubled,
             at_feat=at_feat_combined,
-            listener_latent=listener_doubled
+            listener_latent=listener_doubled,
+            id_emb=id_emb_doubled
+        )
+        
+        pred_cond, pred_uncond = output.chunk(2, dim=0)
+        guided_output = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+        
+        return guided_output
+    
+    def _guided_denoise_rdla_with_context(self, x, t_values, context_buffer, audio_features, frame_idx, frames_to_generate, guidance_scale, listener_window=None, condition_dict=None):
+        """
+        RDLA 风格的引导去噪（使用 context_buffer）
+        
+        Args:
+            context_buffer: 上下文缓冲区
+            condition_dict: 可选的条件字典，用于提取 ID embedding
+        """
+        batch_size = x.shape[0]
+        device = x.device
+        
+        x_doubled = torch.cat([x] * 2, dim=0)
+        seed_doubled = torch.cat([context_buffer] * 2, dim=0)
+        
+        # Process ID embedding for CFG
+        id_emb_doubled = None
+        if self.use_id and condition_dict is not None:
+            id_emb = self._get_id_embedding(condition_dict, batch_size)
+            id_emb_doubled = torch.cat([id_emb, id_emb], dim=0) if id_emb is not None else None
+        
+        at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
+        
+        target_seq_len = at_feat.shape[1]
+        target_feat_dim = at_feat.shape[2]
+        null_cond_embed = self.denoiser.get_null_cond_embed(target_seq_len, target_feat_dim, at_feat.device)
+        
+        at_feat_uncond = null_cond_embed.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        at_feat_combined = torch.cat([at_feat, at_feat_uncond], dim=0)
+        
+        listener_doubled = None
+        if listener_window is not None:
+            null_listener = self.null_listener_embed.expand(listener_window.shape[1], -1)
+            listener_cond = listener_window
+            listener_uncond = null_listener.unsqueeze(0).expand(batch_size, -1, -1)
+            listener_doubled = torch.cat([listener_cond, listener_uncond], dim=0)
+        
+        if t_values.dim() == 2:
+            timesteps_doubled = torch.cat([t_values[:, 0], t_values[:, 0]], dim=0)
+        else:
+            timesteps_doubled = torch.cat([t_values, t_values], dim=0)
+        
+        output = self.denoiser(
+            x=x_doubled,
+            timesteps=timesteps_doubled,
+            seed=seed_doubled,
+            at_feat=at_feat_combined,
+            listener_latent=listener_doubled,
+            id_emb=id_emb_doubled
         )
         
         pred_cond, pred_uncond = output.chunk(2, dim=0)
@@ -1122,6 +1392,9 @@ class InteractiveGestureLSM(GestureLSM):
         pre_frames = seed.shape[1]
         T = self.window_size
         total_frames = audio_features.shape[1]
+        
+        # Extract ID embedding once at the beginning
+        id_emb = self._get_id_embedding(condition_dict, batch_size)
         
         self.window_buffer = torch.randn(
             batch_size, T, self.input_dim * self.num_joints, device=device
@@ -1176,7 +1449,8 @@ class InteractiveGestureLSM(GestureLSM):
                     timesteps=t_values[:, 0],
                     seed=condition_dict['y']['seed'],
                     at_feat=at_feat,
-                    listener_latent=listener_window
+                    listener_latent=listener_window,
+                    id_emb=id_emb
                 )
             
             v_pred = v_pred.squeeze(2)
@@ -1223,7 +1497,8 @@ class InteractiveGestureLSM(GestureLSM):
                     timesteps=t_curr[:, 0],
                     seed=condition_dict['y']['seed'],
                     at_feat=at_feat,
-                    listener_latent=listener_window
+                    listener_latent=listener_window,
+                    id_emb=id_emb
                 )
             
             v_pred = v_pred.squeeze(2)
@@ -1273,7 +1548,8 @@ class InteractiveGestureLSM(GestureLSM):
                     timesteps=t_new[:, 0],
                     seed=condition_dict['y']['seed'],
                     at_feat=at_feat,
-                    listener_latent=listener_window
+                    listener_latent=listener_window,
+                    id_emb=id_emb
                 )
             
             v_pred_incr = v_pred_incr.squeeze(2)
@@ -1298,6 +1574,12 @@ class InteractiveGestureLSM(GestureLSM):
         x_doubled = torch.cat([x] * 2, dim=0)
         seed_doubled = torch.cat([condition_dict['y']['seed']] * 2, dim=0)
         
+        # Process ID embedding for CFG
+        id_emb_doubled = None
+        if self.use_id:
+            id_emb = self._get_id_embedding(condition_dict, batch_size)
+            id_emb_doubled = torch.cat([id_emb, id_emb], dim=0) if id_emb is not None else None
+        
         at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
         
         target_seq_len = at_feat.shape[1]
@@ -1321,7 +1603,61 @@ class InteractiveGestureLSM(GestureLSM):
             timesteps=timesteps_doubled,
             seed=seed_doubled,
             at_feat=at_feat_combined,
-            listener_latent=listener_doubled
+            listener_latent=listener_doubled,
+            id_emb=id_emb_doubled
+        )
+        
+        pred_cond, pred_uncond = output.chunk(2, dim=0)
+        guided_output = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+        
+        return guided_output
+    
+    def _guided_denoise_rflav_with_context(self, x, t_values, context_buffer, audio_features, frame_idx, guidance_scale, listener_window=None, condition_dict=None):
+        """
+        RFLAV 风格的引导去噪（使用滚动的 context_buffer）
+        
+        与 _guided_denoise_rflav 的区别：使用滚动的 context_buffer 作为 seed
+        
+        Args:
+            condition_dict: 可选的条件字典，用于提取 ID embedding
+        """
+        batch_size = x.shape[0]
+        device = x.device
+        
+        x_doubled = torch.cat([x] * 2, dim=0)
+        seed_doubled = torch.cat([context_buffer] * 2, dim=0)
+        
+        # Process ID embedding for CFG
+        id_emb_doubled = None
+        if self.use_id and condition_dict is not None:
+            id_emb = self._get_id_embedding(condition_dict, batch_size)
+            id_emb_doubled = torch.cat([id_emb, id_emb], dim=0) if id_emb is not None else None
+        
+        at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
+        
+        target_seq_len = at_feat.shape[1]
+        target_feat_dim = at_feat.shape[2]
+        null_cond_embed = self.denoiser.get_null_cond_embed(target_seq_len, target_feat_dim, at_feat.device)
+        
+        at_feat_uncond = null_cond_embed.unsqueeze(0).expand(batch_size, -1, -1)
+        at_feat_combined = torch.cat([at_feat, at_feat_uncond], dim=0)
+        
+        listener_doubled = None
+        if listener_window is not None:
+            null_listener = self.null_listener_embed.expand(listener_window.shape[1], -1)
+            listener_cond = listener_window
+            listener_uncond = null_listener.unsqueeze(0).expand(batch_size, -1, -1)
+            listener_doubled = torch.cat([listener_cond, listener_uncond], dim=0)
+        
+        timesteps_doubled = torch.cat([t_values[:, 0], t_values[:, 0]], dim=0)
+        
+        output = self.denoiser(
+            x=x_doubled,
+            timesteps=timesteps_doubled,
+            seed=seed_doubled,
+            at_feat=at_feat_combined,
+            listener_latent=listener_doubled,
+            id_emb=id_emb_doubled
         )
         
         pred_cond, pred_uncond = output.chunk(2, dim=0)
@@ -1353,7 +1689,9 @@ class InteractiveGestureLSM(GestureLSM):
         self.window_buffer = torch.randn(
             batch_size, T, self.input_dim * self.num_joints, device=device
         )
-        # self.context_buffer = seed.clone()
+        
+        gt_seed = seed.clone()
+        context_buffer = seed.clone()
         
         generated_sequence = []
         for i in range(pre_frames):
@@ -1374,16 +1712,70 @@ class InteractiveGestureLSM(GestureLSM):
                 
                 dt = 1.0 / num_pre_roll_steps
                 
+                alpha = self._get_blend_alpha(frame_idx, pre_frames, total_frames)
+                if self.use_gt_seed_inference:
+                    blended_seed = gt_seed
+                elif alpha < 1.0:
+                    gt_seed_window = gt_seed
+                    blended_seed = self._blend_seed_with_prediction(gt_seed_window, context_buffer, alpha)
+                else:
+                    blended_seed = context_buffer
+                
+                full_input = self.window_buffer
+                
+                nframes = full_input.shape[1]
+                full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
+                full_input_4d = full_input_4d.permute(0, 2, 3, 1)
+                
+                listener_window = None
+                if self.use_listener_feedback:
+                    listener_window = listener_loader.get_history(frame_idx)
+                
+                if guidance_scale > 1.0:
+                    v_pred = self._guided_denoise_rflav_with_context(
+                        full_input_4d, t_values, blended_seed,
+                        audio_features, frame_idx, guidance_scale, listener_window,
+                        condition_dict=condition_dict
+                    )
+                else:
+                    at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
+                    id_emb = self._get_id_embedding(condition_dict, batch_size)
+                    v_pred = self.denoiser(
+                        x=full_input_4d,
+                        timesteps=t_values[:, 0],
+                        seed=blended_seed,
+                        at_feat=at_feat,
+                        listener_latent=listener_window,
+                        id_emb=id_emb
+                    )
+                
+                v_pred = v_pred.squeeze(2)
+                v_pred_3d = v_pred.permute(0, 2, 1)
+                
+                window_frames = self.window_buffer.shape[1]
+                self.window_buffer = self.window_buffer + dt * v_pred_3d[:, -window_frames:, :]
+                
                 pre_roll_step += 1
                 if pre_roll_step >= num_pre_roll_steps:
                     is_pre_roll_phase = False
-            else:
-                w = 0.0
-                k = torch.arange(T, device=device).float()
-                t_values = 1.0 - (k + w) / T
-                t_values = t_values.unsqueeze(0).expand(batch_size, -1)
                 
-                dt = 1.0 / T
+                continue
+            
+            w = 0.0
+            k = torch.arange(T, device=device).float()
+            t_values = 1.0 - (k + w) / T
+            t_values = t_values.unsqueeze(0).expand(batch_size, -1)
+            
+            dt = 1.0 / T
+            
+            alpha = self._get_blend_alpha(frame_idx, pre_frames, total_frames)
+            if self.use_gt_seed_inference:
+                blended_seed = gt_seed
+            elif alpha < 1.0:
+                gt_seed_window = gt_seed
+                blended_seed = self._blend_seed_with_prediction(gt_seed_window, context_buffer, alpha)
+            else:
+                blended_seed = context_buffer
             
             full_input = self.window_buffer
             
@@ -1396,18 +1788,21 @@ class InteractiveGestureLSM(GestureLSM):
                 listener_window = listener_loader.get_history(frame_idx)
             
             if guidance_scale > 1.0:
-                v_pred = self._guided_denoise_rflav(
-                    full_input_4d, t_values, condition_dict, 
-                    audio_features, frame_idx, guidance_scale, listener_window
+                v_pred = self._guided_denoise_rflav_with_context(
+                    full_input_4d, t_values, blended_seed,
+                    audio_features, frame_idx, guidance_scale, listener_window,
+                    condition_dict=condition_dict
                 )
             else:
                 at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
+                id_emb = self._get_id_embedding(condition_dict, batch_size)
                 v_pred = self.denoiser(
                     x=full_input_4d,
                     timesteps=t_values[:, 0],
-                    seed=condition_dict['y']['seed'],
+                    seed=blended_seed,
                     at_feat=at_feat,
-                    listener_latent=listener_window
+                    listener_latent=listener_window,
+                    id_emb=id_emb
                 )
             
             v_pred = v_pred.squeeze(2)
@@ -1419,12 +1814,12 @@ class InteractiveGestureLSM(GestureLSM):
             output_frame = self.window_buffer[:, 0:1, :]
             generated_sequence.append(output_frame.squeeze(1))
             
-            # self.context_buffer = torch.cat([
-            #     self.context_buffer[:, 1:, :],
-            #     output_frame
-            # ], dim=1)
-            # if self.context_buffer.shape[1] > pre_frames:
-            #     self.context_buffer = self.context_buffer[:, -pre_frames:, :]
+            context_buffer = torch.cat([
+                context_buffer[:, 1:, :],
+                output_frame
+            ], dim=1)
+            if context_buffer.shape[1] > pre_frames:
+                context_buffer = context_buffer[:, -pre_frames:, :]
             
             self.window_buffer = torch.cat([
                 self.window_buffer[:, 1:, :],
@@ -1432,6 +1827,193 @@ class InteractiveGestureLSM(GestureLSM):
             ], dim=1)
             
             frame_idx += 1
+        
+        generated_sequence = torch.stack(generated_sequence, dim=1)
+        return generated_sequence
+
+    @torch.no_grad()
+    def generate_online_rflav_with_ladder(self, condition_dict, audio_features, listener_loader,
+                                          guidance_scale=2.0, total_frames=None):
+        """
+        RFLAV + Ladder 融合推理流程
+        
+        融合 RFLAV 的双阶段调度和 RDLA 的阶梯机制：
+        - Pre-roll phase: 保持 RFLAV 的平滑预热
+        - Normal phase: 固定阶梯式时间步分布，每次输出第一个 ladder 的帧
+        
+        核心思想：
+        - 时间步分布固定：t = 1.0 - ladder_idx / num_ladders
+        - 同一个 ladder 内的帧使用相同时间步
+        - 每次迭代输出第一个 ladder 的帧（最干净）
+        - 窗口滑动后，新进入的帧为纯噪声
+        - 当 ladder=1 时，自动退化为原始 RFLAV
+        
+        Args:
+            total_frames: 生成总帧数。如果为None，则使用audio_features.shape[1]
+        """
+        batch_size = audio_features.shape[0]
+        device = audio_features.device
+        
+        seed = condition_dict['y']['seed']
+        pre_frames = seed.shape[1]
+        self.pre_frames = pre_frames
+        T = self.window_size
+        l = self.ladder_step
+        num_ladders = T // l
+        
+        if total_frames is None:
+            total_frames = audio_features.shape[1]
+        
+        self.window_buffer = torch.randn(
+            batch_size, T, self.input_dim * self.num_joints, device=device
+        )
+        
+        gt_seed = seed.clone()
+        context_buffer = seed.clone()
+        
+        generated_sequence = []
+        for i in range(pre_frames):
+            generated_sequence.append(seed[:, i, :])
+        
+        frame_idx = pre_frames
+        
+        is_pre_roll_phase = True
+        pre_roll_step = 0
+        num_pre_roll_steps = self.pre_roll_steps
+        
+        while frame_idx < total_frames:
+            frames_to_generate = min(l, total_frames - frame_idx)
+            
+            if is_pre_roll_phase:
+                w = 1.0 - pre_roll_step / num_pre_roll_steps
+                k = torch.arange(T, device=device).float()
+                k_ladder = (k / l).floor() * l
+                t_values = torch.clamp(1.0 - (k_ladder / T + w), min=0.0, max=1.0)
+                t_values = t_values.unsqueeze(0).expand(batch_size, -1)
+                
+                dt = 1.0 / num_pre_roll_steps
+                
+                alpha = self._get_blend_alpha(frame_idx, pre_frames, total_frames)
+                if self.use_gt_seed_inference:
+                    blended_seed = gt_seed
+                elif alpha < 1.0:
+                    gt_seed_window = gt_seed
+                    blended_seed = self._blend_seed_with_prediction(gt_seed_window, context_buffer, alpha)
+                else:
+                    blended_seed = context_buffer
+                
+                full_input = self.window_buffer
+                
+                nframes = full_input.shape[1]
+                full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
+                full_input_4d = full_input_4d.permute(0, 2, 3, 1)
+                
+                listener_window = None
+                if self.use_listener_feedback:
+                    listener_window = listener_loader.get_history(frame_idx)
+                
+                if guidance_scale > 1.0:
+                    v_pred = self._guided_denoise_rflav_with_context(
+                        full_input_4d, t_values, blended_seed,
+                        audio_features, frame_idx, guidance_scale, listener_window,
+                        condition_dict=condition_dict
+                    )
+                else:
+                    at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
+                    id_emb = self._get_id_embedding(condition_dict, batch_size)
+                    v_pred = self.denoiser(
+                        x=full_input_4d,
+                        timesteps=t_values[:, 0],
+                        seed=blended_seed,
+                        at_feat=at_feat,
+                        listener_latent=listener_window,
+                        id_emb=id_emb
+                    )
+                
+                v_pred = v_pred.squeeze(2)
+                v_pred_3d = v_pred.permute(0, 2, 1)
+                
+                window_frames = self.window_buffer.shape[1]
+                self.window_buffer = self.window_buffer + dt * v_pred_3d[:, -window_frames:, :]
+                
+                pre_roll_step += 1
+                if pre_roll_step >= num_pre_roll_steps:
+                    is_pre_roll_phase = False
+                
+                continue
+            
+            k = torch.arange(T, device=device).float()
+            ladder_idx = k // l
+            t_values = 1.0 - ladder_idx / num_ladders
+            t_values = t_values.clamp(0.0, 1.0)
+            t_values = t_values.unsqueeze(0).expand(batch_size, -1)
+            
+            dt = 1.0 / num_ladders
+            
+            alpha = self._get_blend_alpha(frame_idx, pre_frames, total_frames)
+            if self.use_gt_seed_inference:
+                blended_seed = gt_seed
+            elif alpha < 1.0:
+                gt_seed_window = gt_seed
+                blended_seed = self._blend_seed_with_prediction(gt_seed_window, context_buffer, alpha)
+            else:
+                blended_seed = context_buffer
+            
+            full_input = self.window_buffer
+            
+            nframes = full_input.shape[1]
+            full_input_4d = full_input.view(batch_size, nframes, self.num_joints, self.input_dim)
+            full_input_4d = full_input_4d.permute(0, 2, 3, 1)
+            
+            listener_window = None
+            if self.use_listener_feedback:
+                listener_window = listener_loader.get_history(frame_idx)
+            
+            if guidance_scale > 1.0:
+                v_pred = self._guided_denoise_rflav_with_context(
+                    full_input_4d, t_values, blended_seed,
+                    audio_features, frame_idx, guidance_scale, listener_window,
+                    condition_dict=condition_dict
+                )
+            else:
+                at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
+                id_emb = self._get_id_embedding(condition_dict, batch_size)
+                v_pred = self.denoiser(
+                    x=full_input_4d,
+                    timesteps=t_values[:, 0],
+                    seed=blended_seed,
+                    at_feat=at_feat,
+                    listener_latent=listener_window,
+                    id_emb=id_emb
+                )
+            
+            v_pred = v_pred.squeeze(2)
+            v_pred_3d = v_pred.permute(0, 2, 1)
+            
+            window_frames = self.window_buffer.shape[1]
+            self.window_buffer = self.window_buffer + dt * v_pred_3d[:, -window_frames:, :]
+            
+            output_frames = self.window_buffer[:, :frames_to_generate, :]
+            
+            if frames_to_generate > 1 and self.ofs_threshold < 1.0:
+                output_frames = self.apply_ofs_smoothing(output_frames)
+            
+            for i in range(frames_to_generate):
+                generated_sequence.append(output_frames[:, i, :])
+            
+            context_buffer = torch.cat([
+                context_buffer[:, frames_to_generate:, :],
+                output_frames
+            ], dim=1)
+            if context_buffer.shape[1] > pre_frames:
+                context_buffer = context_buffer[:, -pre_frames:, :]
+            
+            self.window_buffer = torch.cat([
+                self.window_buffer[:, frames_to_generate:, :],
+                torch.randn(batch_size, frames_to_generate, self.input_dim * self.num_joints, device=device)
+            ], dim=1)
+            
+            frame_idx += frames_to_generate
         
         generated_sequence = torch.stack(generated_sequence, dim=1)
         return generated_sequence
@@ -1658,6 +2240,9 @@ class InteractiveGestureLSM(GestureLSM):
         seed = condition_dict['y']['seed']
         self.init_rolling_window(batch_size, device, idle_pose=seed)
         
+        gt_seed = seed.clone()
+        context_buffer = seed.clone()
+        
         generated_sequence = []
         if total_frames is None:
             total_frames = audio_features.shape[1]
@@ -1679,6 +2264,14 @@ class InteractiveGestureLSM(GestureLSM):
         while frame_idx < total_frames:
             frames_to_generate = min(l, total_frames - frame_idx)
             
+            alpha = self._get_blend_alpha(frame_idx, pre_frames, total_frames)
+            if self.use_gt_seed_inference:
+                blended_seed = gt_seed
+            elif alpha < 1.0:
+                blended_seed = self._blend_seed_with_prediction(gt_seed, context_buffer, alpha)
+            else:
+                blended_seed = context_buffer
+            
             dt = 1.0 / num_ladders
             
             t_values = self._get_ladder_t_values_v2(batch_size, N, l, num_ladders, t_0_l, device)
@@ -1694,21 +2287,23 @@ class InteractiveGestureLSM(GestureLSM):
                 listener_window = listener_loader.get_history(frame_idx)
             
             if guidance_scale > 1.0:
-                v_pred = self._guided_denoise_rdla(
-                    full_input_4d, t_values, condition_dict, 
+                v_pred = self._guided_denoise_rdla_with_context(
+                    full_input_4d, t_values, blended_seed, 
                     audio_features, frame_idx, frames_to_generate, guidance_scale,
-                    listener_window
+                    listener_window, condition_dict=condition_dict
                 )
             else:
                 at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
                 
                 timesteps = t_values[:, 0] if t_values.dim() == 2 else t_values
+                id_emb = self._get_id_embedding(condition_dict, batch_size)
                 v_pred = self.denoiser(
                     x=full_input_4d,
                     timesteps=timesteps,
-                    seed=condition_dict['y']['seed'],
+                    seed=blended_seed,
                     at_feat=at_feat,
-                    listener_latent=listener_window
+                    listener_latent=listener_window,
+                    id_emb=id_emb
                 )
             
             v_pred = v_pred.squeeze(2)
@@ -1727,14 +2322,13 @@ class InteractiveGestureLSM(GestureLSM):
             for i in range(frames_to_generate):
                 generated_sequence.append(output_frames[:, i, :])
             
-            # 注释掉 context_buffer 滚动：暂时不使用 Speaker 的 context 信息
-            # self.context_buffer = torch.cat([
-            #     self.context_buffer[:, frames_to_generate:, :],
-            #     output_frames
-            # ], dim=1)
-            # 
-            # if self.context_buffer.shape[1] > pre_frames:
-            #     self.context_buffer = self.context_buffer[:, -pre_frames:, :]
+            context_buffer = torch.cat([
+                context_buffer[:, frames_to_generate:, :],
+                output_frames
+            ], dim=1)
+            
+            if context_buffer.shape[1] > pre_frames:
+                context_buffer = context_buffer[:, -pre_frames:, :]
             
             if t_0_l == 0:
                 self.window_buffer = torch.randn(
@@ -1762,6 +2356,12 @@ class InteractiveGestureLSM(GestureLSM):
         x_doubled = torch.cat([x] * 2, dim=0)
         seed_doubled = torch.cat([condition_dict['y']['seed']] * 2, dim=0)
         
+        # Process ID embedding for CFG
+        id_emb_doubled = None
+        if self.use_id:
+            id_emb = self._get_id_embedding(condition_dict, batch_size)
+            id_emb_doubled = torch.cat([id_emb, id_emb], dim=0) if id_emb is not None else None
+        
         at_feat = self.get_audio_window(audio_features, frame_idx, batch_size, device)
         
         target_seq_len = at_feat.shape[1]
@@ -1786,7 +2386,8 @@ class InteractiveGestureLSM(GestureLSM):
             timesteps=timesteps_doubled,
             seed=seed_doubled,
             at_feat=at_feat_combined,
-            listener_latent=listener_doubled
+            listener_latent=listener_doubled,
+            id_emb=id_emb_doubled
         )
         
         pred_cond, pred_uncond = output.chunk(2, dim=0)

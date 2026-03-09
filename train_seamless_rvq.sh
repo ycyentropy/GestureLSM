@@ -110,6 +110,7 @@ for part in $PARTS; do
         --code-dim $CODE_DIM \
         --nb-code $NB_CODE \
         --exp-name $EXP_NAME \
+        --sliding-window \
         --gpu-id $GPU_ID \
     
     echo "${BODY_PARTS[$part]}训练完成，等待${SLEEP_TIME}秒..."

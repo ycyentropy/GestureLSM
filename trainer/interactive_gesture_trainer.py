@@ -111,7 +111,7 @@ class InteractiveGestureTrainer:
         logger.info("Creating datasets...")
         
         self.train_dataset = DyadicFeedbackDataset(self.cfg, split='train', build_cache=True)
-        self.val_dataset = DyadicFeedbackDataset(self.cfg, split='val', build_cache=True)
+        self.val_dataset = DyadicFeedbackDataset(self.cfg, split='test_small', build_cache=True) #val
 
         if self.cfg.ddp:
             world_size = dist.get_world_size()
@@ -298,13 +298,23 @@ class InteractiveGestureTrainer:
                 "model_state"
             ]
         
-        # 移除 module. 前缀（DDP 训练时保存的格式）
+        # 检查 checkpoint 和当前模型的 key 格式
+        ckpt_has_module = any(k.startswith('module.') for k in ckpt_state_dict.keys())
+        model_has_module = any(k.startswith('module.') for k in self.model.state_dict().keys())
+        
+        # 根据 checkpoint 和当前模型的格式调整 key
         new_state_dict = {}
         for k, v in ckpt_state_dict.items():
-            if k.startswith('module.'):
-                new_state_dict[k[7:]] = v  # 移除 'module.' 前缀
+            if ckpt_has_module and not model_has_module:
+                # checkpoint 有 module. 前缀，模型没有 -> 移除前缀
+                new_key = k[7:] if k.startswith('module.') else k
+            elif not ckpt_has_module and model_has_module:
+                # checkpoint 没有 module. 前缀，模型有 -> 添加前缀
+                new_key = 'module.' + k if not k.startswith('module.') else k
             else:
-                new_state_dict[k] = v
+                # 格式一致，不需要修改
+                new_key = k
+            new_state_dict[new_key] = v
         ckpt_state_dict = new_state_dict
         
         # 过滤不需要的参数
@@ -603,10 +613,18 @@ class InteractiveGestureTrainer:
         logger.info(pstr)
 
     def save_checkpoint(self, epoch, iteration, is_best=False, best_metric_name=None):
+        model_state_dict = self.model.state_dict()
+        new_state_dict = {}
+        for k, v in model_state_dict.items():
+            if k.startswith('module.'):
+                new_state_dict[k[7:]] = v
+            else:
+                new_state_dict[k] = v
+        
         checkpoint = {
             'epoch': epoch,
             'iteration': iteration,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': new_state_dict,
             'optimizer_state_dict': self.opt.state_dict(),
             'scheduler_state_dict': self.opt_s.state_dict() if self.opt_s else None,
             'val_best': self.val_best,
@@ -735,6 +753,14 @@ class InteractiveGestureTrainer:
                             guidance_scale=self.cfg.model.guidance_scale,
                             total_frames=total_frames
                         )
+                    elif self.inference_mode == "rflav_ladder":
+                        generated_latents = self.model.module.generate_online_rflav_with_ladder(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
+                        )
                     else:
                         generated_latents = self.model.module.generate_online_rdla(
                             condition_dict=condition_dict,
@@ -755,6 +781,14 @@ class InteractiveGestureTrainer:
                     total_frames = loaded_data["speaker_latents"].shape[1]
                     if self.inference_mode == "rflav":
                         generated_latents = self.model.generate_online_rflav(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
+                        )
+                    elif self.inference_mode == "rflav_ladder":
+                        generated_latents = self.model.generate_online_rflav_with_ladder(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
@@ -786,6 +820,7 @@ class InteractiveGestureTrainer:
                     logger.info(f"[DEBUG] pre_frames_pose: {pre_frames_pose}")
 
                 vae_test_len = self.cfg.vae_test_len
+                vae_len = self.cfg.vae_length
                 n_gen = n_pose - pre_frames_pose
                 remain = n_gen % vae_test_len
                 if val_count <= 3:
@@ -795,10 +830,10 @@ class InteractiveGestureTrainer:
                     latent_tar = self.eval_copy.map2latent(tar_pose[:, pre_frames_pose : pre_frames_pose + n_gen - remain])
 
                     latent_out_list.append(
-                        latent_rec.reshape(-1, vae_test_len).detach().cpu().numpy()
+                        latent_rec.reshape(-1, vae_test_len).detach().cpu().numpy() #vae_test_len
                     )
                     latent_ori_list.append(
-                        latent_tar.reshape(-1, vae_test_len).detach().cpu().numpy()
+                        latent_tar.reshape(-1, vae_test_len).detach().cpu().numpy() #vae_test_len
                     )
 
                 if self.l1_calculator is not None:
@@ -885,6 +920,14 @@ class InteractiveGestureTrainer:
                             guidance_scale=self.cfg.model.guidance_scale,
                             total_frames=total_frames
                         )
+                    elif self.inference_mode == "rflav_ladder":
+                        generated_latents = self.model.module.generate_online_rflav_with_ladder(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
+                        )
                     else:
                         generated_latents = self.model.module.generate_online_rdla(
                             condition_dict=condition_dict,
@@ -905,6 +948,14 @@ class InteractiveGestureTrainer:
                     total_frames = loaded_data["speaker_latents"].shape[1]
                     if self.inference_mode == "rflav":
                         generated_latents = self.model.generate_online_rflav(
+                            condition_dict=condition_dict,
+                            audio_features=audio_features,
+                            listener_loader=listener_loader,
+                            guidance_scale=self.cfg.model.guidance_scale,
+                            total_frames=total_frames
+                        )
+                    elif self.inference_mode == "rflav_ladder":
+                        generated_latents = self.model.generate_online_rflav_with_ladder(
                             condition_dict=condition_dict,
                             audio_features=audio_features,
                             listener_loader=listener_loader,
@@ -979,6 +1030,21 @@ class InteractiveGestureTrainer:
             ckpt_state_dict = checkpoint["model_state_dict"]
         except:
             ckpt_state_dict = checkpoint["model_state"]
+        
+        ckpt_has_module = any(k.startswith('module.') for k in ckpt_state_dict.keys())
+        model_has_module = any(k.startswith('module.') for k in self.model.state_dict().keys())
+        
+        new_state_dict = {}
+        for k, v in ckpt_state_dict.items():
+            if ckpt_has_module and not model_has_module:
+                new_key = k[7:] if k.startswith('module.') else k
+            elif not ckpt_has_module and model_has_module:
+                new_key = 'module.' + k if not k.startswith('module.') else k
+            else:
+                new_key = k
+            new_state_dict[new_key] = v
+        ckpt_state_dict = new_state_dict
+        
         ckpt_state_dict = {
             k: v
             for k, v in ckpt_state_dict.items()

@@ -32,6 +32,8 @@ class DyadicFeedbackDataset(Dataset):
             self.data_path = os.path.join(base_data_path, 'train')
         elif split == 'val':
             self.data_path = os.path.join(base_data_path, 'val')
+        elif split == 'test_small':
+            self.data_path = os.path.join(base_data_path, 'test_small')
         else:
             self.data_path = os.path.join(base_data_path, 'test')
         
@@ -215,8 +217,18 @@ class DyadicFeedbackDataset(Dataset):
         }
     
     def _generate_segments_from_pair(self, pair_data, pair_idx):
+        """
+        从数据对中生成训练片段
+        
+        新逻辑：
+        1. 每个文件的 speaker 就是文件名中的人（例如 P0027A → P0027）
+        2. 检查每个 transcript 的时长，如果 >= min_speak_duration，就提取这段时间
+        3. train 数据集：对长片段进行切片
+        4. test_small 数据集：不做切片，保持原始片段
+        """
         segments = []
         
+        # 获取 P1 和 P2 的数据
         p1_pose = pair_data['p1']['pose_data']['pose']
         p2_pose = pair_data['p2']['pose_data']['pose']
         p1_motion_valid = pair_data['p1']['pose_data'].get('motion_valid', np.ones(len(p1_pose), dtype=bool))
@@ -225,7 +237,14 @@ class DyadicFeedbackDataset(Dataset):
         p2_utterances = pair_data['p2']['json_data'][0]
         p1_word_data = pair_data['p1']['json_data'][1]
         p2_word_data = pair_data['p2']['json_data'][1]
+        p1_npz_path = pair_data['p1']['npz_path']
+        p2_npz_path = pair_data['p2']['npz_path']
         
+        # 从文件名提取 speaker ID
+        p1_speaker_id = self._extract_speaker_id_from_filename(p1_npz_path)
+        p2_speaker_id = self._extract_speaker_id_from_filename(p2_npz_path)
+        
+        # 对齐 word data
         if len(p1_word_data) != len(p1_pose):
             p1_word_data = self._align_word_data(p1_word_data, len(p1_pose))
         if len(p2_word_data) != len(p2_pose):
@@ -246,74 +265,125 @@ class DyadicFeedbackDataset(Dataset):
         clip_start_frame = int(clip_start_t * self.pose_fps)
         clip_end_frame = int(clip_end_t * self.pose_fps)
         
-        min_segment_length = self.pose_length * 2
+        # 找到所有时长 >= min_speak_duration 的 transcript
+        valid_speech_segments = []
         
-        if clip_end_frame - clip_start_frame < min_segment_length:
-            return segments
-        
-        p1_valid_segments = self.find_continuous_valid_segments(p1_final_valid[clip_start_frame:clip_end_frame], min_duration_threshold=5.0)
-        p2_valid_segments = self.find_continuous_valid_segments(p2_final_valid[clip_start_frame:clip_end_frame], min_duration_threshold=5.0)
-        
-        n_p1_segments = 0
-        n_p2_segments = 0
-        n_filtered_duration = 0
-        n_filtered_speaker = 0
-        
-        window_duration = 10.0
-        window_size = self.pose_length
-        
-        for p1_seg in p1_valid_segments:
-            p1_seg_start, p1_seg_end = p1_seg
-            p1_abs_start = clip_start_frame + p1_seg_start
-            p1_abs_end = clip_start_frame + p1_seg_end
+        # 检查 P1 的 transcripts
+        for utt in p1_utterances:
+            utt_start = utt.get('start', 0)
+            utt_end = utt.get('end', 0)
+            duration = utt_end - utt_start
             
-            for window_start in range(p1_abs_start, p1_abs_end - window_size + 1, self.stride):
-                window_end = window_start + window_size
+            if duration >= self.min_speak_duration:
+                # 转换为帧
+                frame_start = int(utt_start * self.pose_fps)
+                frame_end = int(utt_end * self.pose_fps)
                 
-                mid_frame = (window_start + window_end) // 2
-                mid_time = mid_frame / self.pose_fps
+                # 确保在有效范围内
+                frame_start = max(frame_start, clip_start_frame)
+                frame_end = min(frame_end, clip_end_frame)
                 
-                p1_is_speaker = self._check_is_speaker(p1_utterances, mid_time - window_duration/2, mid_time + window_duration/2)
-                p2_is_speaker = self._check_is_speaker(p2_utterances, mid_time - window_duration/2, mid_time + window_duration/2)
+                if frame_end - frame_start >= self.pose_length:
+                    valid_speech_segments.append({
+                        'speaker': p1_speaker_id,
+                        'frame_start': frame_start,
+                        'frame_end': frame_end,
+                        'utt_start': utt_start,
+                        'utt_end': utt_end,
+                        'duration': duration
+                    })
+        
+        # 检查 P2 的 transcripts
+        for utt in p2_utterances:
+            utt_start = utt.get('start', 0)
+            utt_end = utt.get('end', 0)
+            duration = utt_end - utt_start
+            
+            if duration >= self.min_speak_duration:
+                # 转换为帧
+                frame_start = int(utt_start * self.pose_fps)
+                frame_end = int(utt_end * self.pose_fps)
                 
-                if p1_is_speaker or p2_is_speaker:
-                    if p1_is_speaker and p2_is_speaker:
-                        p1_speak_time = 0.0
-                        p2_speak_time = 0.0
-                        for utt in p1_utterances:
-                            utt_start = utt.get('start', 0)
-                            utt_end = utt.get('end', 0)
-                            overlap_start = max(window_start / self.pose_fps, utt_start)
-                            overlap_end = min(window_end / self.pose_fps, utt_end)
-                            if overlap_start < overlap_end:
-                                p1_speak_time += (overlap_end - overlap_start)
-                        for utt in p2_utterances:
-                            utt_start = utt.get('start', 0)
-                            utt_end = utt.get('end', 0)
-                            overlap_start = max(window_start / self.pose_fps, utt_start)
-                            overlap_end = min(window_end / self.pose_fps, utt_end)
-                            if overlap_start < overlap_end:
-                                p2_speak_time += (overlap_end - overlap_start)
-                        
-                        if p1_speak_time >= p2_speak_time:
-                            segment = self._create_segment(pair_data, window_start, window_end, speaker_idx=0)
-                        else:
-                            segment = self._create_segment(pair_data, window_start, window_end, speaker_idx=1)
-                    elif p1_is_speaker:
-                        segment = self._create_segment(pair_data, window_start, window_end, speaker_idx=0)
-                    elif p2_is_speaker:
-                        segment = self._create_segment(pair_data, window_start, window_end, speaker_idx=1)
+                # 确保在有效范围内
+                frame_start = max(frame_start, clip_start_frame)
+                frame_end = min(frame_end, clip_end_frame)
+                
+                if frame_end - frame_start >= self.pose_length:
+                    valid_speech_segments.append({
+                        'speaker': p2_speaker_id,
+                        'frame_start': frame_start,
+                        'frame_end': frame_end,
+                        'utt_start': utt_start,
+                        'utt_end': utt_end,
+                        'duration': duration
+                    })
+        
+        # 根据数据集类型处理片段
+        if self.split == 'train':
+            # train：对长片段进行切片（滑动窗口）
+            for seg in valid_speech_segments:
+                seg_start = seg['frame_start']
+                seg_end = seg['frame_end']
+                
+                # 滑动窗口切片
+                for window_start in range(seg_start, seg_end - self.pose_length + 1, self.stride):
+                    window_end = window_start + self.pose_length
                     
+                    segment = self._create_segment_from_window(
+                        pair_data, window_start, window_end, seg['speaker'],
+                        p1_final_valid, p2_final_valid,
+                        p1_word_data, p2_word_data
+                    )
                     if segment is not None:
                         segments.append(segment)
-                        if p1_is_speaker:
-                            n_p1_segments += 1
-                        else:
-                            n_p2_segments += 1
-                else:
-                    n_filtered_speaker += 1
+        else:
+            # test_small 和 val：不做切片，每个 valid segment 直接作为一个样本
+            for seg in valid_speech_segments:
+                segment = self._create_segment_from_speech(
+                    pair_data, seg, 
+                    p1_final_valid, p2_final_valid,
+                    p1_word_data, p2_word_data
+                )
+                if segment is not None:
+                    segments.append(segment)
         
         return segments
+    
+    def _extract_speaker_id_from_filename(self, npz_path):
+        """从文件名提取 speaker ID"""
+        fname = os.path.basename(npz_path)
+        parts = fname.replace('.npz', '').split('_')
+        if len(parts) >= 4:
+            # 例如：V00_S0194_I00000487_P0266 → P0266
+            return parts[3]
+        return None
+    
+    def _create_segment_from_speech(self, pair_data, seg, p1_valid, p2_valid, p1_words, p2_words):
+        """从 speech segment 创建样本（test_small 使用）"""
+        frame_start = seg['frame_start']
+        frame_end = seg['frame_end']
+        speaker = seg['speaker']
+        
+        # 检查有效性
+        if frame_end - frame_start < self.pose_length:
+            return None
+        
+        # 使用 speech 的起止时间
+        return self._create_segment(
+            pair_data, frame_start, frame_end,
+            speaker_id=speaker,
+            p1_valid=p1_valid, p2_valid=p2_valid,
+            p1_words=p1_words, p2_words=p2_words
+        )
+    
+    def _create_segment_from_window(self, pair_data, window_start, window_end, speaker, p1_valid, p2_valid, p1_words, p2_words):
+        """从滑动窗口创建样本（train 使用）"""
+        return self._create_segment(
+            pair_data, window_start, window_end,
+            speaker_id=speaker,
+            p1_valid=p1_valid, p2_valid=p2_valid,
+            p1_words=p1_words, p2_words=p2_words
+        )
     
     def _check_is_speaker(self, utterances, window_start, window_end):
         """
@@ -479,13 +549,43 @@ class DyadicFeedbackDataset(Dataset):
             }
         }
     
-    def _create_segment(self, pair_data, start_frame, end_frame, speaker_idx):
-        if speaker_idx == 0:
-            speaker_data = pair_data['p1']
-            listener_data = pair_data['p2']
+    def _create_segment(self, pair_data, start_frame, end_frame, speaker_id=None, speaker_idx=None, p1_valid=None, p2_valid=None, p1_words=None, p2_words=None):
+        """
+        创建训练片段
+        
+        Args:
+            pair_data: 配对数据
+            start_frame: 开始帧
+            end_frame: 结束帧
+            speaker_id: speaker ID（从文件名提取，如 'P0027'）
+            speaker_idx: speaker 索引（0=P1, 1=P2，向后兼容）
+            p1_valid: P1 的有效性掩码
+            p2_valid: P2 的有效性掩码
+            p1_words: P1 的 word 数据
+            p2_words: P2 的 word 数据
+        """
+        # 向后兼容：如果没有 speaker_id，使用 speaker_idx
+        if speaker_id is None:
+            if speaker_idx == 0:
+                speaker_data = pair_data['p1']
+                listener_data = pair_data['p2']
+                speaker_id_from_file = self._extract_speaker_id_from_filename(pair_data['p1']['npz_path'])
+            else:
+                speaker_data = pair_data['p2']
+                listener_data = pair_data['p1']
+                speaker_id_from_file = self._extract_speaker_id_from_filename(pair_data['p2']['npz_path'])
         else:
-            speaker_data = pair_data['p2']
-            listener_data = pair_data['p1']
+            # 使用 speaker_id 确定 speaker 和 listener
+            p1_speaker_id = self._extract_speaker_id_from_filename(pair_data['p1']['npz_path'])
+            
+            if speaker_id == p1_speaker_id:
+                speaker_data = pair_data['p1']
+                listener_data = pair_data['p2']
+            else:
+                speaker_data = pair_data['p2']
+                listener_data = pair_data['p1']
+            
+            speaker_id_from_file = speaker_id
         
         speaker_pose_data = speaker_data['pose_data']
         listener_pose_data = listener_data['pose_data']
@@ -501,6 +601,21 @@ class DyadicFeedbackDataset(Dataset):
             return None
         if end_frame > len(listener_pose_data['pose']):
             return None
+        
+        # 检查有效性掩码（新增）
+        if p1_valid is not None and p2_valid is not None:
+            # 确定哪个是 speaker 的 valid 掩码
+            p1_speaker_id = self._extract_speaker_id_from_filename(pair_data['p1']['npz_path'])
+            if speaker_id == p1_speaker_id:
+                speaker_valid = p1_valid[start_frame:end_frame]
+                listener_valid = p2_valid[start_frame:end_frame]
+            else:
+                speaker_valid = p2_valid[start_frame:end_frame]
+                listener_valid = p1_valid[start_frame:end_frame]
+            
+            # 检查窗口内的所有帧是否都有效
+            if not np.all(speaker_valid) or not np.all(listener_valid):
+                return None
         
         speaker_sample = {
             'pose': speaker_pose_data['pose'][start_frame:end_frame],
@@ -549,7 +664,7 @@ class DyadicFeedbackDataset(Dataset):
                 'listener_file': os.path.basename(listener_data['npz_path']),
                 'start_frame': start_frame,
                 'end_frame': end_frame,
-                'speaker_idx': speaker_idx,
+                'speaker_id': speaker_id_from_file,
             }
         }
     

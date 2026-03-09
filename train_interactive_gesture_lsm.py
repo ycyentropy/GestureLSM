@@ -298,7 +298,7 @@ def main():
     
     logger.info("Creating datasets...")
     train_dataset = DyadicFeedbackDataset(cfg, split='train', build_cache=True)
-    val_dataset = DyadicFeedbackDataset(cfg, split='val', build_cache=True)
+    val_dataset = DyadicFeedbackDataset(cfg, split='test_small', build_cache=True) #val
     
     train_loader = DataLoader(
         train_dataset,
